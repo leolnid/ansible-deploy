@@ -16,15 +16,15 @@
     state: link
   notify: Restart Nginx
 
-- name: Removes "default" site
-  file:
-    path: "/etc/nginx/sites-enabled/default"
-    state: absent
-  notify: Restart Nginx
-
 # UFW Configuration
 - name: "UFW - Allow HTTP on port 443"
   ufw:
     rule: allow
     port: '443'
+    proto: tcp
+
+- name: "UFW - Allow HTTP on port 80"
+  ufw:
+    rule: allow
+    port: '80'
     proto: tcp
