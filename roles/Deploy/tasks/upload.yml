@@ -10,7 +10,7 @@
 
 - name: Rsync application files to the remote server
   ansible.posix.synchronize:
-    src: "{{ playbook_dir }}/.."
+    src: "{{ playbook_dir }}/../../.."
     dest: "{{ remote_root_path }}"
     recursive: true
     delete: true
