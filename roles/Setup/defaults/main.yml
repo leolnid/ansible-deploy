@@ -1,0 +1,3 @@
+---
+copy_local_key: "{{ lookup('env','ANSIBLE_SSH_PUBLIC_KEY') }}"
+sys_packages: [ 'curl', 'vim', 'git', 'ufw', 'acl', 'rpm', 'supervisor' ]

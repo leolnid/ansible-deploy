@@ -1,0 +1,42 @@
+---
+- name: Set up .env file
+  ansible.builtin.template:
+    src: env.j2
+    dest: "{{ remote_root_path }}/.env"
+    mode: '0755'
+    owner: "{{ remote_root_owner }}"
+    group: "{{ remote_root_group }}"
+
+- name: Install Dependencies with Composer
+  become: true
+  become_user: '{{ remote_root_owner }}'
+  community.general.composer:
+    command: install
+    working_dir: "{{ remote_root_path }}"
+  tags: [ 'composer' ]
+
+- name: Setup cron
+  ansible.builtin.cron:
+    name: 'Запустить планировщик для проекта {{ domain }}'
+    user: '{{ remote_root_owner }}'
+    job: 'cd {{ remote_root_path }} && php artisan schedule:run >> {{ remote_storage_path }}/logs/cron.log'
+  tags: [ 'cron' ]
+
+- name: Setup supervisor
+  block:
+    - name: Check config file
+      become: true
+      ansible.builtin.template:
+        src: supervisor-queue.conf.j2
+        dest: "/etc/supervisor/conf.d/{{ domain }}-queue.conf"
+
+    - name: Reload supervisor config
+      command: supervisorctl reread
+
+    - name: Restart supervisor
+      supervisorctl:
+        name: "{{ domain | replace('.', '-') }}-queue"
+        state: restarted
+        config: '/etc/supervisor/supervisord.conf'
+
+  tags: [ 'supervisor' ]

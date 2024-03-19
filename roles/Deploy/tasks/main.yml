@@ -1,0 +1,58 @@
+---
+- name: Upload files to server
+  ansible.builtin.include_tasks: upload.yml
+
+- name: Setup env and composer
+  ansible.builtin.include_tasks: setup.yml
+
+- name: Laravel
+  block:
+    - name: Run Migrations + Seeders
+      become: true
+      become_user: '{{ remote_root_owner }}'
+      ansible.builtin.command: "/usr/bin/php {{ remote_root_path }}/artisan migrate --force --seed"
+      tags: [ 'laravel', 'artisan_migrate' ]
+
+    - name: Run yarn install
+      become: true
+      become_user: '{{ remote_root_owner }}'
+      ansible.builtin.command: "/usr/bin/yarn install"
+      args:
+        chdir: "{{ remote_root_path }}"
+      tags: [ 'yarn_install' ]
+
+    - name: Run yarn build
+      become: true
+      become_user: '{{ remote_root_owner }}'
+      ansible.builtin.command: "/usr/bin/yarn build"
+      args:
+        chdir: "{{ remote_root_path }}"
+      tags: [ 'yarn_build' ]
+
+    - name: Run deploy laravel commands
+      become: true
+      become_user: '{{ remote_root_owner }}'
+      ansible.builtin.command: "/usr/bin/php {{ remote_root_path }}/artisan {{ item }}"
+      tags: [ 'laravel', 'artisan_deploy' ]
+
+      with_items:
+        - storage:link
+        - key:generate
+        - route:clear
+        - config:clear
+        - optimize
+        - event:cache
+        - queue:restart
+        - deploy:success
+
+
+- name: Make sure the remote app root has the right permissions
+  ansible.builtin.file:
+    path: "{{ remote_root_path }}"
+    state: directory
+    mode: '0755'
+    recurse: yes
+    owner: "{{ remote_root_owner }}"
+    group: "{{ remote_root_group }}"
+
+

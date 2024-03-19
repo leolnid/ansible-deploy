@@ -1,0 +1,30 @@
+---
+- name: Install Nginx
+  apt: name=nginx update_cache=yes state=latest
+
+# Nginx Configuration
+- name: Sets Nginx conf file
+  template:
+    src: "nginx.conf.j2"
+    dest: "/etc/nginx/sites-available/{{ domain }}.conf"
+    force: true
+
+- name: Enables new site
+  file:
+    src: "/etc/nginx/sites-available/{{ domain }}.conf"
+    dest: "/etc/nginx/sites-enabled/{{ domain }}.conf"
+    state: link
+  notify: Restart Nginx
+
+- name: Removes "default" site
+  file:
+    path: "/etc/nginx/sites-enabled/default"
+    state: absent
+  notify: Restart Nginx
+
+# UFW Configuration
+- name: "UFW - Allow HTTP on port 443"
+  ufw:
+    rule: allow
+    port: '443'
+    proto: tcp

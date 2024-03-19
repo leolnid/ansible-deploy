@@ -1,0 +1,9 @@
+---
+- name: Checks if Composer is already installed
+  ansible.builtin.stat:
+    path: "{{ composer_path }}"
+  register: composer_installed
+
+- name: Install Composer if its not already installed
+  ansible.builtin.include_tasks: install.yml
+  when: not composer_installed.stat.exists

@@ -1,0 +1,42 @@
+---
+- name: Make sure the remote app root exists and has the right permissions
+  ansible.builtin.file:
+    path: "{{ remote_root_path }}"
+    state: directory
+    mode: '0755'
+    recurse: yes
+    owner: "{{ remote_root_owner }}"
+    group: "{{ remote_root_group }}"
+
+- name: Rsync application files to the remote server
+  ansible.posix.synchronize:
+    src: "{{ playbook_dir }}/.."
+    dest: "{{ remote_root_path }}"
+    recursive: true
+    delete: true
+    rsync_opts:
+      - "--no-motd"
+      - "--exclude=.git,vendor,tests,storage/logs/*,storage/framework/sessions/*,storage/framework/cache/*"
+
+- name: Make sure the remote app root has the right permissions
+  ansible.builtin.file:
+    path: "{{ remote_root_path }}"
+    state: directory
+    mode: '0755'
+    recurse: yes
+    owner: "{{ remote_root_owner }}"
+    group: "{{ remote_root_group }}"
+
+- name: Set up additional directory permissions for www-data user on storage folder
+  ansible.posix.acl:
+    path: "{{ remote_storage_path }}"
+    entry: group:www-data:rwX
+    recursive: yes
+    state: present
+
+- name: Set up additional directory permissions for www-data user on bootstrap/cache folder
+  ansible.posix.acl:
+    path: "{{ remote_root_path }}/bootstrap/cache/"
+    entry: group:www-data:rwX
+    recursive: yes
+    state: present

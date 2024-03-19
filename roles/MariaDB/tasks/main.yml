@@ -1,0 +1,24 @@
+---
+- name: Get MySQL version with non-default credentials
+  mysql_info:
+    filter: version
+
+    login_user: '{{ mysql_root_username }}'
+    login_password: '{{ mysql_root_password }}'
+    login_unix_socket: /var/run/mysqld/mysqld.sock
+  register: _mysql_version
+  ignore_errors: true
+
+- name: Install mariadb if mariadb is not installed
+  ansible.builtin.import_tasks: install.yml
+  when: "'version' not in _mysql_version
+    or 'major' not in _mysql_version.version
+    or _mysql_version.version.major < 8"
+
+- name: Ensure database and user exist
+  block:
+    - name: Create user if not exist
+      ansible.builtin.import_tasks: create_user.yml
+
+    - name: Create database if not exist
+      ansible.builtin.import_tasks: create_database.yml

@@ -1,0 +1,11 @@
+[program:{{ domain | replace('.', '-') }}-queue]
+command=php {{ remote_root_path }}/artisan queue:work --tries=3 --backoff=360 --timeout=60
+directory={{ remote_root_path }}
+user=www-data
+
+autostart=true
+autorestart=true
+numprocs=1
+redirect_stderr=true
+stdout_logfile={{ remote_storage_path }}/logs/queue.log
+stderr_logfile={{ remote_storage_path }}/logs/queue.log

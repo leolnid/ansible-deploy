@@ -1,0 +1,34 @@
+---
+# Префикс приложения/рабочее название
+application: "{{ lookup('ansible.builtin.env', 'PREFIX') }}"
+root_domain: "{{ lookup('ansible.builtin.env', 'ROOT_DOMAIN') }}"
+domain: "{{ lookup('ansible.builtin.env', 'DOMAIN') | default(application + '.' + root_domain, True) }}"
+php_version: "{{ lookup('ansible.builtin.env', 'PHP_VERSION', default='8.2') }}"
+developer_email: "leonid.dyukov@gmail.com"
+
+# Основные переменные сервера
+remote_www_path: "{{ lookup('ansible.builtin.env', 'REMOTE_WWW', default='/var/www') }}"
+remote_root_owner: "{{ lookup('ansible.builtin.env', 'REMOTE_USER', default='www-data') }}"
+remote_root_group: "{{ lookup('ansible.builtin.env', 'REMOTE_GROUP', default='user') }}"
+
+remote_root_path: "{{ remote_www_path }}/{{ domain }}"
+remote_storage_path: "{{ remote_root_path }}/storage"
+remote_public_path: "{{ remote_root_path }}/public"
+
+# MySQL Setup
+mysql_root_username: "{{ lookup('ansible.builtin.env', 'MYSQL_ROOT_USERNAME', default='root') }}"
+mysql_root_password: "{{ lookup('ansible.builtin.env', 'MYSQL_ROOT_PASSWORD') }}"
+mysql_host: "{{ lookup('ansible.builtin.env', 'MYSQL_HOST', default='127.0.0.1') }}"
+mysql_port: "{{ lookup('ansible.builtin.env', 'MYSQL_PORT', default='3306') }}"
+mysql_database: "{{ lookup('ansible.builtin.env', 'MYSQL_DATABASE') | default(domain.replace('.', '_'), True) }}"
+mysql_username: "{{ lookup('ansible.builtin.env', 'MYSQL_USERNAME') | default(domain.replace('.', '_'), True) }}"
+mysql_password: "{{ lookup('ansible.builtin.env', 'MYSQL_PASSWORD') }}"
+
+# Laravel Env Variables
+application_name: "{{ lookup('ansible.builtin.env', 'APP_NAME') }}"
+application_env: "{{ lookup('ansible.builtin.env', 'APP_ENV', default='development') }}"
+application_debug: "{{ lookup('ansible.builtin.env', 'APP_DEBUG', default='false') }}"
+application_url: "https://{{ domain }}"
+
+additional_env: "{{ lookup('ansible.builtin.env', 'ADDITIONAL_ENV') }}"
+node_version: "20"
