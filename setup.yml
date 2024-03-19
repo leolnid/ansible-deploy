@@ -11,14 +11,15 @@
     - role: Php
       tags: [ 'php', 'web', 'php-fpm', 'lemp' ]
 
+    - role: MariaDB
+      tags: [ 'mysql', 'lemp' ]
+
     - role: Nginx
       tags: [ 'nginx', 'web', 'http', 'lemp' ]
 
     - role: NginxCertbot
       tags: [ 'nginx', 'web', 'https', 'certbot', 'lemp' ]
 
-    - role: MariaDB
-      tags: [ 'mysql', 'lemp' ]
 
     - role: Composer
       tags: [ 'composer' ]
