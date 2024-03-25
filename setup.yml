@@ -2,17 +2,5 @@
 - hosts: all
   become: true
   roles:
-    - role: Setup
-      tags: [ 'setup' ]
-
-    - role: Yarn
-      tags: [ 'yarn', 'web', 'lemp' ]
-
-    - role: Php
-      tags: [ 'php', 'web', 'php-fpm', 'lemp' ]
-
     - role: Nginx
       tags: [ 'nginx', 'web', 'http', 'lemp' ]
-
-    - role: Composer
-      tags: [ 'composer' ]
