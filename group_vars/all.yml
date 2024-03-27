@@ -3,6 +3,7 @@
 application: "{{ lookup('ansible.builtin.env', 'PREFIX') }}"
 root_domain: "{{ lookup('ansible.builtin.env', 'ROOT_DOMAIN') }}"
 domain: "{{ lookup('ansible.builtin.env', 'DOMAIN') | default(application + '.' + root_domain, True) }}"
+additional_domains: "{{ lookup('ansible.builtin.env', 'ADDITIONAL_DOMAINS') | default('', True) }}"
 php_version: "{{ lookup('ansible.builtin.env', 'PHP_VERSION', default='8.2') }}"
 developer_email: "leonid.dyukov@gmail.com"
 
