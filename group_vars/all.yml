@@ -35,5 +35,5 @@ additional_env: "{{ lookup('ansible.builtin.env', 'ADDITIONAL_ENV') }}"
 node_version: "20"
 
 sentry_laravel_dns: "{{ lookup('ansible.builtin.env', 'SENTRY_LARAVEL_DNS') }}"
-sentry_traces_sample_rate: "{{ lookup('ansible.builtin.env', 'SENTRY_TRACES_SAMPLE_RATE', default=1.0) }}"
-sentry_profiles_sample_rate: "{{ lookup('ansible.builtin.env', 'SENTRY_PROFILES_SAMPLE_RATE', default=1.0) }}"
+sentry_traces_sample_rate: "{{ lookup('ansible.builtin.env', 'SENTRY_TRACES_SAMPLE_RATE', default=0) }}"
+sentry_profiles_sample_rate: "{{ lookup('ansible.builtin.env', 'SENTRY_PROFILES_SAMPLE_RATE', default=0) }}"
