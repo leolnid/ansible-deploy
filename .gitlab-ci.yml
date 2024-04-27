@@ -1,0 +1,77 @@
+---
+image: willhallonline/ansible:latest
+variables:
+  HOSTS:
+    description: "указать список хостов или группу, по умолчанию all"
+    value: "all"
+  GIT_DEPTH: 5
+  GIT_SUBMODULE_STRATEGY: recursive
+
+stages:
+  - verify
+  - testing
+  - deploy
+
+## prepare for plays
+before_script:
+  - ansible --version
+  - ansible-lint --version
+  - echo "$ANSIBLE_SSH_PRIVATE_KEY" > packages/leolnid/common-deploy/ansible.key
+  - echo "$ANSIBLE_INVENTORY" > packages/leolnid/common-deploy/inventory
+  - chmod 400 packages/leolnid/common-deploy/ansible.key
+  - export ANSIBLE_HOST_KEY_CHECKING=False
+  - cp packages/leolnid/common-deploy/.rsync-filter .rsync-filter
+
+## verify syntax each commit
+#Ansible - Проверка корректности конфига:
+#  stage: verify
+#  script:
+#    - ansible-lint -v packages/leolnid/common-deploy/*.yml
+#    - ansible-playbook --inventory packages/leolnid/common-deploy/inventory --syntax-check *.yml
+#  allow_failure: true
+
+### deploy playbook with manual run
+Ansible - Загрузка файлов на сервер:
+  stage: deploy
+  script:
+    - tree .
+    - >
+      ansible-playbook
+      --private-key packages/leolnid/common-deploy/ansible.key
+      --user ansible
+      --inventory packages/leolnid/common-deploy/inventory
+      --limit ${HOSTS}
+      packages/leolnid/common-deploy/deploy.yml
+
+
+### deploy playbook with manual run
+Ansible - Настройка проекта:
+  stage: deploy
+  script:
+    - >
+      ansible-playbook
+      --private-key packages/leolnid/common-deploy/ansible.key
+      --user ansible
+      --inventory packages/leolnid/common-deploy/inventory
+      --limit ${HOSTS}
+      packages/leolnid/common-deploy/setup.yml
+  when: manual
+
+### deploy playbook with manual run
+Ansible - Настройка сервер:
+  stage: deploy
+  script:
+    - >
+      ansible-playbook
+      --private-key packages/leolnid/common-deploy/ansible.key
+      --user ansible
+      --inventory packages/leolnid/common-deploy/inventory
+      --limit ${HOSTS}
+      packages/leolnid/common-deploy/setup-server.yml
+  when: manual
+
+#Ansible - Ошибка при загрузке:
+#  stage: notify
+#  script:
+#    - sh
+#  when: on_failure #deploy fail
