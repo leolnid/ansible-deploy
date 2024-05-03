@@ -10,7 +10,7 @@
     - name: Run Migrations + Seeders
       become: true
       become_user: '{{ remote_root_owner }}'
-      ansible.builtin.command: "/usr/bin/php {{ remote_root_path }}/artisan migrate --force --seed"
+      ansible.builtin.command: "/usr/bin/php {{ remote_root_path }}/artisan migrate --force"
       tags: [ 'laravel', 'artisan_migrate' ]
 
     - name: Run yarn install
