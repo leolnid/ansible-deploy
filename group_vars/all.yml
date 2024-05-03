@@ -10,7 +10,7 @@ developer_email: "leonid.dyukov@gmail.com"
 # Основные переменные сервера
 remote_www_path: "{{ lookup('ansible.builtin.env', 'REMOTE_WWW', default='/var/www') }}"
 remote_root_owner: "{{ lookup('ansible.builtin.env', 'REMOTE_USER', default='www-data') }}"
-remote_root_group: "{{ lookup('ansible.builtin.env', 'REMOTE_GROUP', default='user') }}"
+remote_root_group: "{{ lookup('ansible.builtin.env', 'REMOTE_GROUP', default='root') }}"
 
 remote_root_path: "{{ remote_www_path }}/{{ domain }}"
 remote_storage_path: "{{ remote_root_path }}/storage"
