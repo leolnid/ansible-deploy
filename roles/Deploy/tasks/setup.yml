@@ -12,6 +12,7 @@
   become_user: '{{ remote_root_owner }}'
   community.general.composer:
     command: install
+    no_dev: false
     working_dir: "{{ remote_root_path }}"
   tags: [ 'composer' ]
 
