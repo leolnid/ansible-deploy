@@ -37,7 +37,6 @@
 
       with_items:
         - storage:link
-        - key:generate
         - route:clear
         - config:clear
         - optimize
