@@ -4,12 +4,14 @@
 - storage/app/public/*
 
 + storage/framework
-- storage/framework/down
-- storage/framework/maintenance.php
+- storage/framework/*
++ storage/framework/cache
 - storage/framework/cache/*
-- storage/framework/cache/*
++ storage/framework/sessions
 - storage/framework/sessions/*
++ storage/framework/testing
 - storage/framework/testing/*
++ storage/framework/views
 - storage/framework/views/*
 
 + storage/logs
