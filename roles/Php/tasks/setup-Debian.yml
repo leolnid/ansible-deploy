@@ -9,7 +9,19 @@
     state: present
 
 - name: Add repository for PHP versions (Ubuntu).
-  apt_repository: repo='ppa:ondrej/php'
+  block:
+    - name: Add Ondrej Surý PPA GPG key for Ubuntu
+      shell: |
+        curl -fsSL https://keyserver.ubuntu.com/pks/lookup?op=get&search=0x4F4EA0AAE5267A6C | gpg --dearmor -o /usr/share/keyrings/ondrej-php.gpg
+      args:
+        creates: /usr/share/keyrings/ondrej-php.gpg
+      
+    - name: Add Ondrej Surý PPA repository for Ubuntu
+      apt_repository:
+        repo: "deb [signed-by=/usr/share/keyrings/ondrej-php.gpg] https://ppa.launchpadcontent.net/ondrej/php/ubuntu {{ ansible_distribution_release }} main"
+        filename: ondrej-php
+        state: present
+        update_cache: yes
   when: ansible_distribution == "Ubuntu"
 
 # Debian-specific tasks.
