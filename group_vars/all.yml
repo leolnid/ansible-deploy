@@ -32,7 +32,6 @@ application_debug: "{{ lookup('ansible.builtin.env', 'APP_DEBUG', default='false
 application_url: "https://{{ domain }}"
 
 additional_env: "{{ lookup('ansible.builtin.env', 'ADDITIONAL_ENV') }}"
-node_version: "20"
 application_encryption_key: "{{ lookup('ansible.builtin.env', 'ENCRYPTION_KEY') }}"
 
 sentry_laravel_dns: "{{ lookup('ansible.builtin.env', 'SENTRY_LARAVEL_DNS') }}"
