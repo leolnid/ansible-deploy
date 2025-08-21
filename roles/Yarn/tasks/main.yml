@@ -9,17 +9,64 @@
     state: present
     update_cache: yes
 
-- name: Install Node.js from Ubuntu repository
+- name: Try to install Node.js and npm from Ubuntu repository
+  apt:
+    name:
+      - nodejs
+      - npm
+    state: present
+    update_cache: yes
+  register: nodejs_install_result
+  ignore_errors: yes
+
+- name: Install Node.js only if npm failed
   apt:
     name: nodejs
     state: present
     update_cache: yes
+  when: nodejs_install_result is failed
 
-- name: Install npm from Ubuntu repository
-  apt:
-    name: npm
-    state: present
-    update_cache: yes
+- name: Try alternative npm installation method
+  block:
+    - name: Download and install npm manually
+      shell: |
+        curl -fsSL https://www.npmjs.com/install.sh | sh
+      args:
+        creates: /usr/bin/npm
+      ignore_errors: yes
+    
+    - name: Check if npm was installed
+      stat:
+        path: /usr/bin/npm
+      register: npm_check
+    
+    - name: Install npm via Node.js if manual install failed
+      shell: |
+        curl -fsSL https://nodejs.org/dist/v20.11.0/node-v20.11.0-linux-x64.tar.xz | tar -xJ -C /tmp
+        sudo cp -r /tmp/node-v20.11.0-linux-x64/* /usr/local/
+        sudo ln -sf /usr/local/bin/node /usr/bin/node
+        sudo ln -sf /usr/local/bin/npm /usr/bin/npm
+      args:
+        creates: /usr/bin/npm
+      when: npm_check.stat.exists == false
+      ignore_errors: yes
+  when: nodejs_install_result is failed
+
+- name: Verify Node.js installation
+  command: node --version
+  register: node_version
+  changed_when: false
+  ignore_errors: yes
+
+- name: Verify npm installation
+  command: npm --version
+  register: npm_version
+  changed_when: false
+  ignore_errors: yes
+
+- name: Display Node.js and npm versions
+  debug:
+    msg: "Node.js: {{ node_version.stdout | default('Not installed') }}, npm: {{ npm_version.stdout | default('Not installed') }}"
 
 - name: Add Yarn GPG key
   shell: |
@@ -34,8 +81,38 @@
     state: present
     update_cache: yes
 
-- name: Install Yarn
+- name: Try to install Yarn from repository
   apt:
     name: yarn
     state: present
     update_cache: yes
+  register: yarn_install_result
+  ignore_errors: yes
+
+- name: Install Yarn via npm if repository install failed
+  shell: |
+    npm install -g yarn
+  args:
+    creates: /usr/bin/yarn
+  when: yarn_install_result is failed
+  ignore_errors: yes
+
+- name: Verify Yarn installation
+  command: yarn --version
+  register: yarn_version
+  changed_when: false
+  ignore_errors: yes
+
+- name: Display final installation status
+  debug:
+    msg: |
+      Installation completed:
+      - Node.js: {{ node_version.stdout | default('Not installed') }}
+      - npm: {{ npm_version.stdout | default('Not installed') }}
+      - Yarn: {{ yarn_version.stdout | default('Not installed') }}
+
+- name: Clean up temporary files
+  file:
+    path: /tmp/node-v20.11.0-linux-x64
+    state: absent
+  ignore_errors: yes
