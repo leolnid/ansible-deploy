@@ -30,19 +30,22 @@
     name:
       - apt-transport-https
       - ca-certificates
+      - curl
+      - gnupg
     state: present
   when: ansible_distribution == "Debian"
 
-- name: Add Ondrej Sury's apt key (Debian).
-  apt_key:
-    url: https://packages.sury.org/php/apt.gpg
-    id: 15058500A0235D97F5D10063B188E2B695BD4743
-    state: present
+- name: Add Ondrej Sury's GPG key (Debian).
+  shell: |
+    curl -fsSL https://packages.sury.org/php/apt.gpg | gpg --dearmor -o /usr/share/keyrings/ondrej-php-debian.gpg
+  args:
+    creates: /usr/share/keyrings/ondrej-php-debian.gpg
   when: ansible_distribution == "Debian"
 
 - name: Add Ondrej Sury's repo (Debian).
   apt_repository:
-    repo: "deb https://packages.sury.org/php/ {{ ansible_distribution_release }} main"
+    repo: "deb [signed-by=/usr/share/keyrings/ondrej-php-debian.gpg] https://packages.sury.org/php/ {{ ansible_distribution_release }} main"
+    filename: ondrej-php-debian
     state: present
   register: php_ondrej_debian_repo
   when: ansible_distribution == "Debian"
