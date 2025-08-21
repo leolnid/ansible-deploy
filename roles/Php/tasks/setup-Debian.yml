@@ -5,16 +5,58 @@
 
 - name: Ensure dirmngr is installed (gnupg dependency).
   apt:
-    name: dirmngr
+    name: 
+      - dirmngr
+      - wget
     state: present
 
 - name: Add repository for PHP versions (Ubuntu).
   block:
-    - name: Add Ondrej Surý PPA GPG key for Ubuntu
+    - name: Add Ondrej Surý PPA GPG key for Ubuntu (method 1)
       shell: |
         curl -fsSL https://keyserver.ubuntu.com/pks/lookup?op=get&search=0x4F4EA0AAE5267A6C | gpg --dearmor -o /usr/share/keyrings/ondrej-php.gpg
       args:
         creates: /usr/share/keyrings/ondrej-php.gpg
+      ignore_errors: yes
+      register: gpg_method1
+    
+    - name: Add Ondrej Surý PPA GPG key for Ubuntu (method 2)
+      shell: |
+        curl -fsSL https://keyserver.ubuntu.com/pks/lookup?op=get&search=0x4F4EA0AAE5267A6C&options=mr | gpg --dearmor -o /usr/share/keyrings/ondrej-php.gpg
+      args:
+        creates: /usr/share/keyrings/ondrej-php.gpg
+      when: gpg_method1 is failed
+      ignore_errors: yes
+      register: gpg_method2
+    
+    - name: Add Ondrej Surý PPA GPG key for Ubuntu (method 3 - direct download)
+      shell: |
+        wget -qO- https://keyserver.ubuntu.com/pks/lookup?op=get&search=0x4F4EA0AAE5267A6C | gpg --dearmor -o /usr/share/keyrings/ondrej-php.gpg
+      args:
+        creates: /usr/share/keyrings/ondrej-php.gpg
+      when: gpg_method2 is failed
+      ignore_errors: yes
+      register: gpg_method3
+    
+    - name: Add Ondrej Surý PPA GPG key for Ubuntu (method 4 - alternative keyserver)
+      shell: |
+        gpg --keyserver hkp://keyserver.ubuntu.com:80 --recv-keys 4F4EA0AAE5267A6C
+        gpg --export 4F4EA0AAE5267A6C | gpg --dearmor -o /usr/share/keyrings/ondrej-php.gpg
+      args:
+        creates: /usr/share/keyrings/ondrej-php.gpg
+      when: gpg_method3 is failed
+      ignore_errors: yes
+      register: gpg_method4
+    
+    - name: Check if any GPG method succeeded
+      stat:
+        path: /usr/share/keyrings/ondrej-php.gpg
+      register: gpg_check
+    
+    - name: Fail if no GPG key was obtained
+      fail:
+        msg: "Failed to obtain GPG key for Ondřej Surý PPA. All methods failed."
+      when: gpg_check.stat.exists == false
       
     - name: Add Ondrej Surý PPA repository for Ubuntu
       apt_repository:
@@ -22,6 +64,28 @@
         filename: ondrej-php
         state: present
         update_cache: yes
+      register: ondrej_repo_result
+      ignore_errors: yes
+    
+    - name: Fallback to Ubuntu standard PHP repository if PPA failed
+      block:
+        - name: Remove failed PPA repository
+          file:
+            path: /etc/apt/sources.list.d/ondrej-php.list
+            state: absent
+          ignore_errors: yes
+        
+        - name: Install PHP from Ubuntu standard repository
+          apt:
+            name: "php{{ php_version }}"
+            state: present
+            update_cache: yes
+          ignore_errors: yes
+        
+        - name: Display fallback message
+          debug:
+            msg: "Using Ubuntu standard PHP repository as fallback. PHP version may be older."
+      when: ondrej_repo_result is failed
   when: ansible_distribution == "Ubuntu"
 
 # Debian-specific tasks.
