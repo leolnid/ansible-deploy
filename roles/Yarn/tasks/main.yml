@@ -1,4 +1,9 @@
 ---
+- name: Update apt cache with releaseinfo change allowed
+  command: apt-get update --allow-releaseinfo-change
+  changed_when: false
+  ignore_errors: yes
+
 - name: Install required packages
   apt:
     name:
@@ -7,8 +12,7 @@
       - gnupg
       - lsb-release
     state: present
-    update_cache: yes
-    allow_releaseinfo_change: yes
+    update_cache: no
 
 - name: Try to install Node.js and npm from Ubuntu repository
   apt:
@@ -16,8 +20,7 @@
       - nodejs
       - npm
     state: present
-    update_cache: yes
-    allow_releaseinfo_change: yes
+    update_cache: no
   register: nodejs_install_result
   ignore_errors: yes
 
@@ -25,8 +28,7 @@
   apt:
     name: nodejs
     state: present
-    update_cache: yes
-    allow_releaseinfo_change: yes
+    update_cache: no
   when: nodejs_install_result is failed
 
 - name: Try alternative npm installation method
@@ -82,19 +84,18 @@
     repo: "deb [signed-by=/usr/share/keyrings/yarn.gpg] https://dl.yarnpkg.com/debian/ stable main"
     filename: yarn
     state: present
-    update_cache: yes
+    update_cache: no
   
 - name: Update apt cache with releaseinfo change allowed after Yarn repo
-  apt:
-    update_cache: yes
-    allow_releaseinfo_change: yes
+  command: apt-get update --allow-releaseinfo-change
+  changed_when: false
+  ignore_errors: yes
 
 - name: Try to install Yarn from repository
   apt:
     name: yarn
     state: present
-    update_cache: yes
-    allow_releaseinfo_change: yes
+    update_cache: no
   register: yarn_install_result
   ignore_errors: yes
 

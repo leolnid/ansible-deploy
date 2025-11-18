@@ -13,7 +13,20 @@
   community.general.composer:
     command: install
     no_dev: false
+    no_scripts: true
     working_dir: "{{ remote_root_path }}"
+  tags: [ 'composer' ]
+  ignore_errors: yes
+  register: composer_install_result
+
+- name: Run package:discover manually after composer install
+  become: true
+  become_user: '{{ remote_root_owner }}'
+  ansible.builtin.command: "/usr/bin/php {{ remote_root_path }}/artisan package:discover"
+  args:
+    chdir: "{{ remote_root_path }}"
+  when: composer_install_result is succeeded
+  ignore_errors: yes
   tags: [ 'composer' ]
 
 - name: Setup cron

@@ -1,11 +1,15 @@
 ---
+- name: Update apt cache with releaseinfo change allowed
+  command: apt-get update --allow-releaseinfo-change
+  changed_when: false
+  ignore_errors: yes
+
 - name: Install Prerequisites
   apt:
     name: aptitude
-    update_cache: yes
+    update_cache: no
     state: latest
     force_apt_get: yes
-    allow_releaseinfo_change: yes
   ignore_errors: true
 
 - name: Sudo Group Setup
@@ -50,9 +54,9 @@
 - name: Install packages
   block:
     - name: Update apt
-      apt:
-        update_cache: yes
-        allow_releaseinfo_change: yes
+      command: apt-get update --allow-releaseinfo-change
+      changed_when: false
+      ignore_errors: yes
 
     - name: Install required system packages
       apt: name={{ sys_packages }} state=latest

@@ -63,15 +63,14 @@
         repo: "deb [signed-by=/usr/share/keyrings/ondrej-php.gpg] https://ppa.launchpadcontent.net/ondrej/php/ubuntu {{ ansible_distribution_release }} main"
         filename: ondrej-php
         state: present
-        update_cache: yes
+        update_cache: no
       register: ondrej_repo_result
       ignore_errors: yes
     
     - name: Update apt cache with releaseinfo change allowed
-      apt:
-        update_cache: yes
-        allow_releaseinfo_change: yes
-      when: ondrej_repo_result.changed | default(false)
+      command: apt-get update --allow-releaseinfo-change
+      changed_when: false
+      ignore_errors: yes
     
     - name: Fallback to Ubuntu standard PHP repository if PPA failed
       block:
@@ -85,8 +84,7 @@
           apt:
             name: "php{{ php_version }}"
             state: present
-            update_cache: yes
-            allow_releaseinfo_change: yes
+            update_cache: no
           ignore_errors: yes
         
         - name: Display fallback message
@@ -122,9 +120,9 @@
   when: ansible_distribution == "Debian"
 
 - name: Update apt caches after repo is added (Debian).
-  apt:
-    update_cache: true
-    allow_releaseinfo_change: yes
+  command: apt-get update --allow-releaseinfo-change
+  changed_when: false
+  ignore_errors: yes
   when:
     - php_ondrej_debian_repo.changed
     - ansible_distribution == "Debian"

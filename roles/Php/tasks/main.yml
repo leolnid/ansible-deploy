@@ -41,9 +41,8 @@
 - name: Install PHP Modules / Extensions
   apt:
     name: "{{ item }}"
-    update_cache: yes
+    update_cache: no
     state: latest
-    allow_releaseinfo_change: yes
   loop: "{{ php_packages }}"
 
 

@@ -1,10 +1,14 @@
 ---
+- name: Update apt cache with releaseinfo change allowed
+  command: apt-get update --allow-releaseinfo-change
+  changed_when: false
+  ignore_errors: yes
+
 - name: Install Nginx
   apt:
     name: nginx
-    update_cache: yes
+    update_cache: no
     state: latest
-    allow_releaseinfo_change: yes
 
 # Nginx Configuration
 - name: Sets Nginx conf file
