@@ -1,6 +1,11 @@
 ---
 - name: Install Prerequisites
-  apt: name=aptitude update_cache=yes state=latest force_apt_get=yes
+  apt:
+    name: aptitude
+    update_cache: yes
+    state: latest
+    force_apt_get: yes
+    allow_releaseinfo_change: yes
   ignore_errors: true
 
 - name: Sudo Group Setup
@@ -45,7 +50,9 @@
 - name: Install packages
   block:
     - name: Update apt
-      apt: update_cache=yes
+      apt:
+        update_cache: yes
+        allow_releaseinfo_change: yes
 
     - name: Install required system packages
       apt: name={{ sys_packages }} state=latest

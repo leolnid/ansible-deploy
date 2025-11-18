@@ -8,6 +8,7 @@
       - lsb-release
     state: present
     update_cache: yes
+    allow_releaseinfo_change: yes
 
 - name: Try to install Node.js and npm from Ubuntu repository
   apt:
@@ -16,6 +17,7 @@
       - npm
     state: present
     update_cache: yes
+    allow_releaseinfo_change: yes
   register: nodejs_install_result
   ignore_errors: yes
 
@@ -24,6 +26,7 @@
     name: nodejs
     state: present
     update_cache: yes
+    allow_releaseinfo_change: yes
   when: nodejs_install_result is failed
 
 - name: Try alternative npm installation method
@@ -80,12 +83,18 @@
     filename: yarn
     state: present
     update_cache: yes
+  
+- name: Update apt cache with releaseinfo change allowed after Yarn repo
+  apt:
+    update_cache: yes
+    allow_releaseinfo_change: yes
 
 - name: Try to install Yarn from repository
   apt:
     name: yarn
     state: present
     update_cache: yes
+    allow_releaseinfo_change: yes
   register: yarn_install_result
   ignore_errors: yes
 

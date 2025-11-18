@@ -67,6 +67,12 @@
       register: ondrej_repo_result
       ignore_errors: yes
     
+    - name: Update apt cache with releaseinfo change allowed
+      apt:
+        update_cache: yes
+        allow_releaseinfo_change: yes
+      when: ondrej_repo_result.changed | default(false)
+    
     - name: Fallback to Ubuntu standard PHP repository if PPA failed
       block:
         - name: Remove failed PPA repository
@@ -80,6 +86,7 @@
             name: "php{{ php_version }}"
             state: present
             update_cache: yes
+            allow_releaseinfo_change: yes
           ignore_errors: yes
         
         - name: Display fallback message
@@ -115,7 +122,9 @@
   when: ansible_distribution == "Debian"
 
 - name: Update apt caches after repo is added (Debian).
-  apt: update_cache=true
+  apt:
+    update_cache: true
+    allow_releaseinfo_change: yes
   when:
     - php_ondrej_debian_repo.changed
     - ansible_distribution == "Debian"
