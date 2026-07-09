@@ -1,4 +1,19 @@
 ---
+- name: Ensure Laravel storage directories exist
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: directory
+    mode: '0775'
+    owner: "{{ remote_root_owner }}"
+    group: "{{ remote_root_group }}"
+  loop:
+    - "{{ remote_storage_path }}/framework/cache/data"
+    - "{{ remote_storage_path }}/framework/sessions"
+    - "{{ remote_storage_path }}/framework/views"
+    - "{{ remote_storage_path }}/logs"
+    - "{{ remote_root_path }}/bootstrap/cache"
+  tags: [ 'composer' ]
+
 - name: Set up .env file
   ansible.builtin.template:
     src: env.j2
@@ -58,5 +73,6 @@
         name: "{{ domain | replace('.', '-') }}-queue"
         state: restarted
         config: '/etc/supervisor/supervisord.conf'
+      ignore_errors: yes
 
   tags: [ 'supervisor' ]
