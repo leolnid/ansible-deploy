@@ -7,6 +7,12 @@
     owner: "{{ remote_root_owner }}"
     group: "{{ remote_root_group }}"
 
+- name: Remove broken vendor directory before composer install
+  ansible.builtin.file:
+    path: "{{ remote_root_path }}/vendor"
+    state: absent
+  tags: [ 'composer' ]
+
 - name: Install Dependencies with Composer
   become: true
   become_user: '{{ remote_root_owner }}'
