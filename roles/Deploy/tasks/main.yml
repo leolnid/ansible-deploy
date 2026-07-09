@@ -42,7 +42,7 @@
         - optimize
         - event:cache
         - queue:restart
-        - deploy:success
+        - deployment:success
 
 
 - name: Make sure the remote app root has the right permissions
