@@ -17,17 +17,20 @@ remote_storage_path: "{{ remote_root_path }}/storage"
 remote_public_path: "{{ remote_root_path }}/public"
 
 # MySQL Setup
+# IMPORTANT: do NOT invent DB name/user from domain — that breaks when
+# protected CI vars are missing on unprotected branches (empty lookup →
+# fallback to paykeeper_amorenat_ru etc). Require explicit MYSQL_*.
 mysql_root_username: "{{ lookup('ansible.builtin.env', 'MYSQL_ROOT_USERNAME', default='root') }}"
 mysql_root_password: "{{ lookup('ansible.builtin.env', 'MYSQL_ROOT_PASSWORD') }}"
 mysql_host: "{{ lookup('ansible.builtin.env', 'MYSQL_HOST', default='127.0.0.1') }}"
 mysql_port: "{{ lookup('ansible.builtin.env', 'MYSQL_PORT', default='3306') }}"
-mysql_database: "{{ lookup('ansible.builtin.env', 'MYSQL_DATABASE') | default(domain.replace('.', '_'), True) }}"
-mysql_username: "{{ lookup('ansible.builtin.env', 'MYSQL_USERNAME') | default(domain.replace('.', '_'), True) }}"
+mysql_database: "{{ lookup('ansible.builtin.env', 'MYSQL_DATABASE') }}"
+mysql_username: "{{ lookup('ansible.builtin.env', 'MYSQL_USERNAME') }}"
 mysql_password: "{{ lookup('ansible.builtin.env', 'MYSQL_PASSWORD') }}"
 
 # Laravel Env Variables
 application_name: "{{ lookup('ansible.builtin.env', 'APP_NAME') }}"
-application_env: "{{ lookup('ansible.builtin.env', 'APP_ENV', default='development') }}"
+application_env: "{{ lookup('ansible.builtin.env', 'APP_ENV', default='production') }}"
 application_debug: "{{ lookup('ansible.builtin.env', 'APP_DEBUG', default='false') }}"
 application_url: "https://{{ domain }}"
 
