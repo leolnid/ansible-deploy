@@ -68,6 +68,9 @@
     - name: Reload supervisor config
       command: supervisorctl reread
 
+    - name: Apply supervisor process changes
+      command: supervisorctl update
+
     - name: Restart supervisor
       supervisorctl:
         name: "{{ domain | replace('.', '-') }}-queue"
