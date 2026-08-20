@@ -2,6 +2,7 @@
 command=php {{ remote_root_path }}/artisan queue:work --queue=webhooks,default --tries=3 --backoff=10 --timeout=180
 directory={{ remote_root_path }}
 user=www-data
+process_name=%(program_name)s_%(process_num)02d
 
 autostart=true
 autorestart=true
