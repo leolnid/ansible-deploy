@@ -51,12 +51,6 @@
   ansible.builtin.include_tasks: preserve-alternatives.yml
   when: ansible_os_family == 'Debian'
 
-- name: Install PHP from the Ubuntu standard repository when the PPA is unavailable
-  ansible.builtin.include_tasks: fallback-Ubuntu.yml
-  when:
-    - ansible_distribution == 'Ubuntu'
-    - php_use_ubuntu_standard_php_fallback | default(false) | bool
-
 - name: Install PHP Modules / Extensions
   apt:
     name: "{{ item }}"

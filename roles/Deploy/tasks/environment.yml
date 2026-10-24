@@ -11,6 +11,8 @@
     mode: '0640'
     owner: "{{ remote_root_owner }}"
     group: www-data
+  no_log: true
+  diff: false
   when: not deploy_env_file.stat.exists or (deploy_update_env | default(false) | bool)
 
 - name: Enforce environment file ownership and worker readability

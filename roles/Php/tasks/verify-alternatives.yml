@@ -21,5 +21,3 @@
       PHP alternative {{ item.item.item }} changed during package installation;
       refusing to leave a different default for existing applications.
   loop: "{{ php_alternatives_after.results | selectattr('skipped', 'undefined') | list }}"
-
-\n

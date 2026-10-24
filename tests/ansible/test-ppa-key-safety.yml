@@ -1,0 +1,99 @@
+---
+# Offline regression: an unexpected signer must fail before replacing the
+# installed keyring or touching the existing apt source configuration.
+- hosts: localhost
+  connection: local
+  gather_facts: false
+  tasks:
+    - name: Create an isolated PPA key fixture
+      ansible.builtin.tempfile:
+        state: directory
+        suffix: ppa-key-safety
+      register: ppa_fixture
+
+    - name: Create an isolated GPG home
+      ansible.builtin.file:
+        path: "{{ ppa_fixture.path }}/gnupg"
+        state: directory
+        mode: '0700'
+
+    - name: Generate an unrelated temporary signing key
+      ansible.builtin.command:
+        argv:
+          - gpg
+          - --batch
+          - --homedir
+          - "{{ ppa_fixture.path }}/gnupg"
+          - --passphrase
+          - ''
+          - --quick-generate-key
+          - Test-only signer pretending to be B8DC7E53946656EFBCE4C1DD71DAEAAB4AD4CAB6
+          - rsa1024
+          - sign
+          - '0'
+      changed_when: true
+      no_log: true
+
+    - name: Export the test-only public key
+      ansible.builtin.command:
+        argv:
+          - gpg
+          - --batch
+          - --homedir
+          - "{{ ppa_fixture.path }}/gnupg"
+          - --armor
+          - --export
+      register: unrelated_public_key
+      changed_when: false
+      no_log: true
+
+    - name: Store the unrelated public key as the injected source
+      ansible.builtin.copy:
+        dest: "{{ ppa_fixture.path }}/unrelated.asc"
+        content: "{{ unrelated_public_key.stdout }}"
+        mode: '0600'
+      no_log: true
+
+    - name: Seed existing apt keyring and repository configuration
+      ansible.builtin.copy:
+        dest: "{{ ppa_fixture.path }}/{{ item.path }}"
+        content: "{{ item.content }}"
+        mode: '0644'
+      loop:
+        - { path: existing-keyring.gpg, content: known-good-keyring-marker }
+        - { path: ondrej-php.list, content: known-good-repository-marker }
+
+    - name: Run production key verification against an unrelated signer
+      block:
+        - name: Include the real key-verification tasks with offline paths
+          ansible.builtin.include_tasks: ../../roles/Php/tasks/verify-ubuntu-ppa-key.yml
+          vars:
+            php_ondrej_ppa_signing_fingerprint: B8DC7E53946656EFBCE4C1DD71DAEAAB4AD4CAB6
+            php_ondrej_ppa_key_source_path: "{{ ppa_fixture.path }}/unrelated.asc"
+            php_ondrej_ppa_key_ascii_path: "{{ ppa_fixture.path }}/downloaded.asc"
+            php_ondrej_ppa_keyring_tmp_path: "{{ ppa_fixture.path }}/replacement.gpg"
+            php_ondrej_ppa_keyring_path: "{{ ppa_fixture.path }}/existing-keyring.gpg"
+      rescue:
+        - name: Record that the unexpected signer was rejected
+          ansible.builtin.set_fact:
+            unrelated_signer_rejected: true
+
+    - name: Read the pre-existing keyring and source configuration
+      ansible.builtin.slurp:
+        src: "{{ ppa_fixture.path }}/{{ item }}"
+      loop:
+        - existing-keyring.gpg
+        - ondrej-php.list
+      register: existing_ppa_files
+
+    - name: Require failure before modifying either existing apt file
+      ansible.builtin.assert:
+        that:
+          - unrelated_signer_rejected | default(false)
+          - existing_ppa_files.results[0].content | b64decode == 'known-good-keyring-marker'
+          - existing_ppa_files.results[1].content | b64decode == 'known-good-repository-marker'
+
+    - name: Remove the isolated PPA key fixture
+      ansible.builtin.file:
+        path: "{{ ppa_fixture.path }}"
+        state: absent

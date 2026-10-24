@@ -18,5 +18,3 @@
     - "'Status: auto' in item.stdout_lines"
     - "(item.stdout_lines | select('match', '^Value: /') | list | length) > 0"
   changed_when: true
-
-\n

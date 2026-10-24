@@ -29,3 +29,11 @@ php_alternative_groups:
   - php-config
   - php-fpm.sock
 php_alternatives_command_args: []
+
+# The Launchpad API's current fingerprint for the Ondrej PHP PPA, verified on
+# 2026-10-24. Never treat an existing keyring file's presence as validation.
+php_ondrej_ppa_signing_fingerprint: B8DC7E53946656EFBCE4C1DD71DAEAAB4AD4CAB6
+php_ondrej_ppa_key_url: "https://keyserver.ubuntu.com/pks/lookup?op=get&search=0x{{ php_ondrej_ppa_signing_fingerprint }}"
+php_ondrej_ppa_key_ascii_path: /tmp/ondrej-php-signing-key.asc
+php_ondrej_ppa_keyring_tmp_path: /tmp/ondrej-php-verified.gpg
+php_ondrej_ppa_keyring_path: /usr/share/keyrings/ondrej-php.gpg

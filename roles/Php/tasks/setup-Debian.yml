@@ -4,76 +4,31 @@
     php_opcache_conf_filename: "10-opcache.ini"
 
 - name: Ensure dirmngr is installed (gnupg dependency).
-  apt:
-    name: 
+  ansible.builtin.apt:
+    name:
       - dirmngr
-      - wget
+      - gnupg
+      - ca-certificates
+      - curl
     state: present
 
 - name: Add repository for PHP versions (Ubuntu).
   block:
-    - name: Add Ondrej Surý PPA GPG key for Ubuntu (method 1)
-      shell: |
-        curl -fsSL 'https://keyserver.ubuntu.com/pks/lookup?op=get&search=0x4F4EA0AAE5267A6C' | gpg --dearmor -o /usr/share/keyrings/ondrej-php.gpg
-      args:
-        creates: /usr/share/keyrings/ondrej-php.gpg
-      ignore_errors: yes
-      register: gpg_method1
-    
-    - name: Add Ondrej Surý PPA GPG key for Ubuntu (method 2)
-      shell: |
-        curl -fsSL 'https://keyserver.ubuntu.com/pks/lookup?op=get&search=0x4F4EA0AAE5267A6C&options=mr' | gpg --dearmor -o /usr/share/keyrings/ondrej-php.gpg
-      args:
-        creates: /usr/share/keyrings/ondrej-php.gpg
-      when: gpg_method1 is failed
-      ignore_errors: yes
-      register: gpg_method2
-    
-    - name: Add Ondrej Surý PPA GPG key for Ubuntu (method 3 - direct download)
-      shell: |
-        wget -qO- 'https://keyserver.ubuntu.com/pks/lookup?op=get&search=0x4F4EA0AAE5267A6C' | gpg --dearmor -o /usr/share/keyrings/ondrej-php.gpg
-      args:
-        creates: /usr/share/keyrings/ondrej-php.gpg
-      when: gpg_method2 is failed
-      ignore_errors: yes
-      register: gpg_method3
-    
-    - name: Add Ondrej Surý PPA GPG key for Ubuntu (method 4 - alternative keyserver)
-      shell: |
-        gpg --keyserver hkp://keyserver.ubuntu.com:80 --recv-keys 4F4EA0AAE5267A6C
-        gpg --export 4F4EA0AAE5267A6C | gpg --dearmor -o /usr/share/keyrings/ondrej-php.gpg
-      args:
-        creates: /usr/share/keyrings/ondrej-php.gpg
-      when: gpg_method3 is failed
-      ignore_errors: yes
-      register: gpg_method4
-    
-    - name: Check if any GPG method succeeded
-      stat:
-        path: /usr/share/keyrings/ondrej-php.gpg
-      register: gpg_check
-    
-    - name: Fail if no GPG key was obtained
-      fail:
-        msg: "Failed to obtain GPG key for Ondřej Surý PPA. All methods failed."
-      when: gpg_check.stat.exists == false
-      
-    - name: Add Ondrej Surý PPA repository for Ubuntu
-      apt_repository:
+    - name: Fetch and verify the current Ondrej PPA signing key
+      ansible.builtin.include_tasks: verify-ubuntu-ppa-key.yml
+
+    - name: Add the Ondrej Surý PPA for Ubuntu
+      ansible.builtin.apt_repository:
         repo: "deb [signed-by=/usr/share/keyrings/ondrej-php.gpg] https://ppa.launchpadcontent.net/ondrej/php/ubuntu {{ ansible_distribution_release }} main"
         filename: ondrej-php
         state: present
-        update_cache: no
-      register: ondrej_repo_result
-      ignore_errors: yes
-    
+        update_cache: false
+
     - name: Refresh apt metadata after adding the Ubuntu PHP PPA
       ansible.builtin.apt:
         update_cache: true
+        cache_valid_time: 0
 
-    - name: Record whether Ubuntu requires the standard repository fallback
-      ansible.builtin.set_fact:
-        php_use_ubuntu_standard_php_fallback: "{{ ondrej_repo_result is failed }}"
   when: ansible_distribution == "Ubuntu"
 
 # Debian-specific tasks.

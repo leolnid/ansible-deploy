@@ -6,3 +6,7 @@ deploy_preserve_paths: []
 # Existing server-side credentials and app-specific values are preserved by
 # default; explicitly set true only when inventory should replace the file.
 deploy_update_env: false
+
+# Production deployments omit dev dependencies unless a project explicitly
+# opts out for a controlled non-production environment.
+deploy_composer_no_dev: true

@@ -1,0 +1,82 @@
+---
+- name: Fetch the current Ondrej PPA public key to a temporary file
+  ansible.builtin.get_url:
+    url: "{{ php_ondrej_ppa_key_url }}"
+    dest: "{{ php_ondrej_ppa_key_ascii_path }}"
+    mode: '0600'
+    force: true
+  when: php_ondrej_ppa_key_source_path is not defined
+
+- name: Copy an injected test key source when exercising verification offline
+  ansible.builtin.copy:
+    src: "{{ php_ondrej_ppa_key_source_path }}"
+    dest: "{{ php_ondrej_ppa_key_ascii_path }}"
+    remote_src: true
+    mode: '0600'
+  when: php_ondrej_ppa_key_source_path is defined
+
+- name: Inspect the downloaded key fingerprint without logging key metadata
+  ansible.builtin.command:
+    argv:
+      - gpg
+      - --batch
+      - --with-colons
+      - --show-keys
+      - "{{ php_ondrej_ppa_key_ascii_path }}"
+  register: php_ondrej_key_inspection
+  changed_when: false
+  no_log: true
+
+- name: Extract only the primary public key fingerprint from GPG machine output
+  ansible.builtin.set_fact:
+    php_ondrej_primary_public_key_count: "{{ php_ondrej_key_inspection.stdout_lines | select('match', '^pub:') | list | length }}"
+    php_ondrej_primary_fingerprint: >-
+      {{ (php_ondrej_key_inspection.stdout_lines | select('match', '^fpr:') | first | default('') | split(':'))[9]
+         if (php_ondrej_key_inspection.stdout_lines | select('match', '^fpr:') | first | default('') | split(':') | length) > 9
+         else '' }}
+  no_log: true
+
+- name: Require the exact Launchpad signing-key fingerprint
+  ansible.builtin.assert:
+    that:
+      - php_ondrej_primary_public_key_count | int == 1
+      - php_ondrej_primary_fingerprint == php_ondrej_ppa_signing_fingerprint
+    fail_msg: The fetched PHP PPA key did not match the verified Launchpad signer.
+  no_log: true
+
+- name: Ensure the apt keyring directory exists after fingerprint validation
+  ansible.builtin.file:
+    path: "{{ php_ondrej_ppa_keyring_path | dirname }}"
+    state: directory
+    owner: root
+    group: root
+    mode: '0755'
+
+- name: Convert the verified key to a temporary apt keyring
+  ansible.builtin.command:
+    argv:
+      - gpg
+      - --batch
+      - --yes
+      - --dearmor
+      - --output
+      - "{{ php_ondrej_ppa_keyring_tmp_path }}"
+      - "{{ php_ondrej_ppa_key_ascii_path }}"
+  changed_when: true
+
+- name: Install only the fingerprint-verified keyring
+  ansible.builtin.copy:
+    src: "{{ php_ondrej_ppa_keyring_tmp_path }}"
+    dest: "{{ php_ondrej_ppa_keyring_path }}"
+    remote_src: true
+    owner: root
+    group: root
+    mode: '0644'
+
+- name: Remove temporary verified PPA key files
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: absent
+  loop:
+    - "{{ php_ondrej_ppa_key_ascii_path }}"
+    - "{{ php_ondrej_ppa_keyring_tmp_path }}"

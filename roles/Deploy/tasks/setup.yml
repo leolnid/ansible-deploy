@@ -15,7 +15,10 @@
 - name: Install Dependencies with Composer
   become: true
   become_user: '{{ remote_root_owner }}'
-  ansible.builtin.command: "{{ php_cli_binary }} {{ composer_path }} install --no-scripts"
+  ansible.builtin.command:
+    argv: >-
+      {{ [php_cli_binary, composer_path, 'install', '--no-scripts'] +
+         ((deploy_composer_no_dev | default(true) | bool) | ternary(['--no-dev'], [])) }}
   args:
     chdir: "{{ remote_root_path }}"
   tags: [ 'composer' ]

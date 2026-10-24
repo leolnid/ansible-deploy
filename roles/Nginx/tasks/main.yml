@@ -21,13 +21,13 @@
 
 # UFW Configuration
 - name: "UFW - Allow HTTP on port 443"
-  ansible.builtin.ufw:
+  community.general.ufw:
     rule: allow
     port: '443'
     proto: tcp
 
 - name: "UFW - Allow HTTP on port 80"
-  ansible.builtin.ufw:
+  community.general.ufw:
     rule: allow
     port: '80'
     proto: tcp
