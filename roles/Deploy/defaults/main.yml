@@ -1,0 +1,8 @@
+---
+# Remote-only paths whose contents must survive rsync --delete (for example,
+# a project's public uploads or media directory).
+deploy_preserve_paths: []
+
+# Existing server-side credentials and app-specific values are preserved by
+# default; explicitly set true only when inventory should replace the file.
+deploy_update_env: false

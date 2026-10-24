@@ -1,0 +1,25 @@
+---
+- name: Query PHP alternatives after installation
+  ansible.builtin.command:
+    argv: "{{ ['update-alternatives'] + php_alternatives_command_args + ['--query', item.item] }}"
+  loop: "{{ php_alternatives_before.results }}"
+  register: php_alternatives_after
+  changed_when: false
+  failed_when: false
+  when: item.rc == 0
+
+- name: Confirm previously installed PHP defaults remain selected
+  ansible.builtin.assert:
+    that:
+      - item.rc == 0
+      - "'Status: manual' in item.stdout_lines"
+      - >-
+        (item.stdout_lines | select('match', '^Value: ') | list) ==
+        ((php_alternatives_before.results | selectattr('item', 'equalto', item.item.item) | first).stdout_lines
+        | select('match', '^Value: ') | list)
+    fail_msg: >-
+      PHP alternative {{ item.item.item }} changed during package installation;
+      refusing to leave a different default for existing applications.
+  loop: "{{ php_alternatives_after.results | selectattr('skipped', 'undefined') | list }}"
+
+\n

@@ -1,38 +1,33 @@
 ---
-- name: Update apt cache with releaseinfo change allowed
-  command: apt-get update --allow-releaseinfo-change
-  changed_when: false
-  ignore_errors: yes
-
-- name: Install Nginx
-  apt:
+- name: Install Nginx without upgrading a shared service unexpectedly
+  ansible.builtin.apt:
     name: nginx
-    update_cache: no
-    state: latest
+    state: present
+    update_cache: true
+    cache_valid_time: 3600
 
-# Nginx Configuration
-- name: Sets Nginx conf file
-  template:
-    src: "nginx.conf.j2"
-    dest: "/etc/nginx/sites-available/{{ domain }}.conf"
-    force: true
+- name: Configure only this application's Nginx virtual host
+  ansible.builtin.include_tasks: configure-vhost.yml
+  vars:
+    nginx_site_path: "/etc/nginx/sites-available/{{ domain }}.conf"
+    nginx_site_template: nginx.conf.j2
 
-- name: Enables new site
-  file:
+- name: Enable application virtual host
+  ansible.builtin.file:
     src: "/etc/nginx/sites-available/{{ domain }}.conf"
     dest: "/etc/nginx/sites-enabled/{{ domain }}.conf"
     state: link
-  notify: Restart Nginx
+  notify: Apply Nginx config safely
 
 # UFW Configuration
 - name: "UFW - Allow HTTP on port 443"
-  ufw:
+  ansible.builtin.ufw:
     rule: allow
     port: '443'
     proto: tcp
 
 - name: "UFW - Allow HTTP on port 80"
-  ufw:
+  ansible.builtin.ufw:
     rule: allow
     port: '80'
     proto: tcp

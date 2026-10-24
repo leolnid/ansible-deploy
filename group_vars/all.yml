@@ -5,6 +5,11 @@ root_domain: "{{ lookup('ansible.builtin.env', 'ROOT_DOMAIN') }}"
 domain: "{{ lookup('ansible.builtin.env', 'DOMAIN') | default(application + '.' + root_domain, True) }}"
 additional_domains: "{{ lookup('ansible.builtin.env', 'ADDITIONAL_DOMAINS') | default('', True) }}"
 php_version: "{{ lookup('ansible.builtin.env', 'PHP_VERSION', default='8.2') }}"
+# Debian/Ubuntu expose versioned CLI binaries and FPM sockets. RedHat keeps the
+# existing global package layout; set explicit per-site overrides before using
+# a side-by-side PHP runtime there.
+php_cli_binary: "{{ lookup('ansible.builtin.env', 'PHP_CLI_BINARY', default=('/usr/bin/php' ~ php_version if ansible_facts['os_family'] == 'Debian' else '/usr/bin/php')) }}"
+php_fpm_socket: "{{ lookup('ansible.builtin.env', 'PHP_FPM_SOCKET', default=('/var/run/php/php' ~ php_version ~ '-fpm.sock' if ansible_facts['os_family'] == 'Debian' else '/var/run/php/php-fpm.sock')) }}"
 developer_email: "leonid.dyukov@gmail.com"
 
 # Основные переменные сервера

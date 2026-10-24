@@ -1,0 +1,16 @@
+---
+- name: Ensure the application root directory permissions
+  ansible.builtin.file:
+    path: "{{ remote_root_path }}"
+    state: directory
+    mode: '0755'
+    owner: "{{ remote_root_owner }}"
+    group: "{{ remote_root_group }}"
+
+- name: Preserve application environment file permissions after deploy
+  ansible.builtin.file:
+    path: "{{ remote_root_path }}/.env"
+    state: file
+    mode: '0640'
+    owner: "{{ remote_root_owner }}"
+    group: www-data

@@ -1,60 +1,40 @@
 ---
-# Guard against deploys from unprotected branches that silently drop
-# protected CI variables (PREFIX/MYSQL_*/ENCRYPTION_KEY) and overwrite
-# a working .env with invented DB names like paykeeper_amorenat_ru or
-# ghost paths like /var/www/.amorenat.ru.
-- name: Validate required deploy variables
-  ansible.builtin.assert:
-    that:
-      - application is string and (application | length) > 0
-      - root_domain is string and (root_domain | length) > 0
-      - domain is string and (domain | length) > 0
-      - not (domain | regex_search('^\\.'))
-      - mysql_database is string and (mysql_database | length) > 0
-      - mysql_username is string and (mysql_username | length) > 0
-      - mysql_password is string and (mysql_password | length) > 0
-      - application_encryption_key is string and (application_encryption_key | length) > 0
-    fail_msg: >-
-      Missing required CI env for domain='{{ domain }}'
-      (PREFIX/ROOT_DOMAIN/MYSQL_DATABASE/MYSQL_USERNAME/MYSQL_PASSWORD/ENCRYPTION_KEY).
-      Protected GitLab variables are NOT injected on unprotected branches —
-      unprotect them or deploy from master/main only. Refusing to overwrite .env.
+- name: Preserve an existing environment unless explicitly opted in to update it
+  ansible.builtin.include_tasks: environment.yml
 
-- name: Set up .env file
-  ansible.builtin.template:
-    src: env.j2
-    dest: "{{ remote_root_path }}/.env"
-    mode: '0755'
-    owner: "{{ remote_root_owner }}"
-    group: "{{ remote_root_group }}"
+- name: Remove only generated Laravel manifests from the previous dependency set
+  ansible.builtin.file:
+    path: "{{ remote_root_path }}/bootstrap/cache/{{ item }}"
+    state: absent
+  loop:
+    - config.php
+    - services.php
+    - packages.php
+    - events.php
 
 - name: Install Dependencies with Composer
   become: true
   become_user: '{{ remote_root_owner }}'
-  community.general.composer:
-    command: install
-    no_dev: false
-    no_scripts: true
-    working_dir: "{{ remote_root_path }}"
+  ansible.builtin.command: "{{ php_cli_binary }} {{ composer_path }} install --no-scripts"
+  args:
+    chdir: "{{ remote_root_path }}"
   tags: [ 'composer' ]
-  ignore_errors: yes
   register: composer_install_result
 
 - name: Run package:discover manually after composer install
   become: true
   become_user: '{{ remote_root_owner }}'
-  ansible.builtin.command: "/usr/bin/php {{ remote_root_path }}/artisan package:discover"
+  ansible.builtin.command: "{{ php_cli_binary }} {{ remote_root_path }}/artisan package:discover"
   args:
     chdir: "{{ remote_root_path }}"
   when: composer_install_result is succeeded
-  ignore_errors: yes
   tags: [ 'composer' ]
 
 - name: Setup cron
   ansible.builtin.cron:
     name: 'Запустить планировщик для проекта {{ domain }}'
     user: '{{ remote_root_owner }}'
-    job: 'cd {{ remote_root_path }} && php artisan schedule:run >> {{ remote_storage_path }}/logs/cron.log'
+    job: 'cd {{ remote_root_path }} && {{ php_cli_binary }} artisan schedule:run >> {{ remote_storage_path }}/logs/cron.log'
   tags: [ 'cron' ]
 
 - name: Setup supervisor
@@ -69,7 +49,7 @@
       command: supervisorctl reread
 
     - name: Apply supervisor process changes
-      command: supervisorctl update
+      ansible.builtin.command: "supervisorctl update {{ domain | replace('.', '-') }}-queue"
 
     - name: Restart supervisor
       ansible.builtin.command: "supervisorctl restart {{ domain | replace('.', '-') }}-queue:"

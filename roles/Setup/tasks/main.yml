@@ -1,16 +1,15 @@
 ---
-- name: Update apt cache with releaseinfo change allowed
-  command: apt-get update --allow-releaseinfo-change
-  changed_when: false
-  ignore_errors: yes
+- name: Refresh apt metadata before installing prerequisites
+  ansible.builtin.apt:
+    update_cache: true
+    cache_valid_time: 3600
 
 - name: Install Prerequisites
   apt:
     name: aptitude
     update_cache: no
-    state: latest
+    state: present
     force_apt_get: yes
-  ignore_errors: true
 
 - name: Sudo Group Setup
   block:
@@ -53,13 +52,12 @@
 
 - name: Install packages
   block:
-    - name: Update apt
-      command: apt-get update --allow-releaseinfo-change
-      changed_when: false
-      ignore_errors: yes
-
     - name: Install required system packages
-      apt: name={{ sys_packages }} state=latest
+      ansible.builtin.apt:
+        name: "{{ sys_packages }}"
+        state: present
+        update_cache: true
+        cache_valid_time: 3600
 
 - name: UFW Setup
   block:

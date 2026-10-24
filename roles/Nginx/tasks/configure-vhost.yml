@@ -1,0 +1,40 @@
+---
+- name: Inspect the existing virtual host before writing any template
+  ansible.builtin.stat:
+    path: "{{ nginx_site_path }}"
+  register: nginx_site_stat
+
+- name: Create a plain HTTP virtual host only when no site exists
+  ansible.builtin.template:
+    src: "{{ nginx_site_template }}"
+    dest: "{{ nginx_site_path }}"
+    mode: '0644'
+    force: false
+  when: not nginx_site_stat.stat.exists
+  notify: Apply Nginx config safely
+
+- name: Read an existing virtual host without exposing its contents
+  ansible.builtin.slurp:
+    src: "{{ nginx_site_path }}"
+  register: nginx_existing_site
+  when: nginx_site_stat.stat.exists
+
+- name: Require a Unix PHP-FPM upstream in an existing virtual host
+  ansible.builtin.assert:
+    that:
+      - >-
+        (nginx_existing_site.content | b64decode
+        | regex_findall('(?m)^[ \t]*fastcgi_pass[ \t]+unix:') | length) > 0
+    fail_msg: >-
+      Existing {{ domain }} virtual host has no Unix PHP-FPM upstream. Refusing
+      to replace it or to guess how its TLS and proxy configuration should work.
+  when: nginx_site_stat.stat.exists
+
+- name: Update only PHP-FPM socket directives in an existing virtual host
+  ansible.builtin.replace:
+    path: "{{ nginx_site_path }}"
+    regexp: '(?m)^([ \t]*fastcgi_pass[ \t]+unix:)[^;]+;'
+    replace: '\g<1>{{ php_fpm_socket }};'
+    backup: true
+  when: nginx_site_stat.stat.exists
+  notify: Apply Nginx config safely

@@ -16,3 +16,16 @@ php_post_max_size: "32M"
 
 # For Debian OSes only.
 php_versions_install_recommends: true
+
+# Defaults that can change when another versioned PHP package is installed.
+php_alternative_groups:
+  - php
+  - phar
+  - phar.phar
+  - php-cgi
+  - php-cgi-bin
+  - phpdbg
+  - phpize
+  - php-config
+  - php-fpm.sock
+php_alternatives_command_args: []

@@ -1,0 +1,35 @@
+---
+- name: Inspect the current application environment file
+  ansible.builtin.stat:
+    path: "{{ remote_root_path }}/.env"
+  register: deploy_env_file
+
+- name: Create or explicitly update the application environment file
+  ansible.builtin.template:
+    src: "{{ role_path }}/templates/env.j2"
+    dest: "{{ remote_root_path }}/.env"
+    mode: '0640'
+    owner: "{{ remote_root_owner }}"
+    group: www-data
+  when: not deploy_env_file.stat.exists or (deploy_update_env | default(false) | bool)
+
+- name: Enforce environment file ownership and worker readability
+  ansible.builtin.file:
+    path: "{{ remote_root_path }}/.env"
+    state: file
+    mode: '0640'
+    owner: "{{ remote_root_owner }}"
+    group: www-data
+
+- name: Verify the queue worker can read the application environment
+  ansible.builtin.command:
+    argv:
+      - runuser
+      - -u
+      - www-data
+      - --
+      - test
+      - -r
+      - "{{ remote_root_path }}/.env"
+  changed_when: false
+  when: not (deploy_skip_readability_probe | default(false) | bool)

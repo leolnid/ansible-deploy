@@ -1,21 +1,17 @@
 ---
-- name: Update apt cache with releaseinfo change allowed
-  command: apt-get update --allow-releaseinfo-change
-  changed_when: false
-  ignore_errors: yes
-
 - name: Install required packages
-  apt:
+  ansible.builtin.apt:
     name:
       - ca-certificates
       - curl
       - gnupg
       - lsb-release
     state: present
-    update_cache: no
+    update_cache: yes
+    cache_valid_time: 3600
 
 - name: Try to install Node.js and npm from Ubuntu repository
-  apt:
+  ansible.builtin.apt:
     name:
       - nodejs
       - npm
@@ -86,16 +82,11 @@
     state: present
     update_cache: no
   
-- name: Update apt cache with releaseinfo change allowed after Yarn repo
-  command: apt-get update --allow-releaseinfo-change
-  changed_when: false
-  ignore_errors: yes
-
 - name: Try to install Yarn from repository
-  apt:
+  ansible.builtin.apt:
     name: yarn
     state: present
-    update_cache: no
+    update_cache: yes
   register: yarn_install_result
   ignore_errors: yes
 

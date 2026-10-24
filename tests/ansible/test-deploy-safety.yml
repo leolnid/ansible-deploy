@@ -1,0 +1,313 @@
+---
+# Disposable Linux test: exercise the exact rsync protection rules and final
+# permissions task, then assert the fail-fast and per-site service contracts.
+- hosts: localhost
+  connection: local
+  gather_facts: false
+  vars:
+    remote_root_owner: root
+    remote_root_group: root
+    domain: safety.example.test
+    php_version: '8.5'
+    php_fpm_socket: /run/php/php8.5-fpm.sock
+    additional_domains: ''
+    remote_public_path: /srv/safety/public
+    deploy_preserve_paths:
+      - public/media/
+  tasks:
+    - name: Create isolated deployment fixture
+      ansible.builtin.tempfile:
+        state: directory
+        suffix: deploy-safety
+      register: fixture
+
+    - name: Create fixture roots
+      ansible.builtin.file:
+        path: "{{ fixture.path }}/{{ item }}"
+        state: directory
+        mode: '0755'
+      loop:
+        - source
+        - source/nested/.git
+        - source/public/media
+        - source/vendor
+        - source/storage/media
+        - remote
+        - remote/nested/.git
+        - remote/public/media
+        - remote/vendor
+        - remote/storage/media
+
+    - name: Allow www-data to traverse the temporary fixture parent
+      ansible.builtin.file:
+        path: "{{ fixture.path }}"
+        mode: '0755'
+
+    - name: Create an isolated existing virtual-host directory
+      ansible.builtin.file:
+        path: "{{ fixture.path }}/nginx/sites-available"
+        state: directory
+        mode: '0755'
+
+    - name: Seed existing HTTP and Certbot TLS server blocks
+      ansible.builtin.copy:
+        dest: "{{ fixture.path }}/nginx/sites-available/safety.example.test.conf"
+        mode: '0644'
+        content: |
+          server {
+              listen 80;
+              server_name safety.example.test;
+              root /srv/safety/public;
+              location ~ \\.php$ {
+                  fastcgi_pass unix:/var/run/php/php8.3-fpm.sock;
+              }
+          }
+          server {
+              listen 443 ssl;
+              server_name safety.example.test;
+              ssl_certificate /etc/letsencrypt/live/safety.example.test/fullchain.pem;
+              ssl_certificate_key /etc/letsencrypt/live/safety.example.test/privkey.pem;
+              location ~ \\.php$ {
+                  fastcgi_pass unix:/var/run/php/php8.3-fpm.sock;
+              }
+          }
+
+    - name: Update only the PHP-FPM upstream in the existing virtual host
+      ansible.builtin.include_tasks: ../../roles/Nginx/tasks/configure-vhost.yml
+      vars:
+        nginx_site_path: "{{ fixture.path }}/nginx/sites-available/safety.example.test.conf"
+        nginx_site_template: ../../roles/Nginx/templates/nginx.conf.j2
+
+    - name: Read the updated existing virtual host
+      ansible.builtin.slurp:
+        src: "{{ fixture.path }}/nginx/sites-available/safety.example.test.conf"
+      register: updated_nginx_site
+
+    - name: Confirm existing TLS configuration survives the PHP socket update
+      ansible.builtin.assert:
+        that:
+          - "'listen 80;' in (updated_nginx_site.content | b64decode)"
+          - "'listen 443 ssl;' in (updated_nginx_site.content | b64decode)"
+          - "'ssl_certificate /etc/letsencrypt/live/safety.example.test/fullchain.pem;' in (updated_nginx_site.content | b64decode)"
+          - "'ssl_certificate_key /etc/letsencrypt/live/safety.example.test/privkey.pem;' in (updated_nginx_site.content | b64decode)"
+          - "(updated_nginx_site.content | b64decode | regex_findall('fastcgi_pass unix:/run/php/php8.5-fpm.sock;') | length) == 2"
+          - "'php8.3-fpm.sock' not in (updated_nginx_site.content | b64decode)"
+
+    - name: Create a fresh HTTP virtual host only when no site exists
+      ansible.builtin.include_tasks: ../../roles/Nginx/tasks/configure-vhost.yml
+      vars:
+        nginx_site_path: "{{ fixture.path }}/nginx/sites-available/new.example.test.conf"
+        nginx_site_template: ../../roles/Nginx/templates/nginx.conf.j2
+        domain: new.example.test
+
+    - name: Read the generated new virtual host
+      ansible.builtin.slurp:
+        src: "{{ fixture.path }}/nginx/sites-available/new.example.test.conf"
+      register: new_nginx_site
+
+    - name: Confirm a new template uses the selected socket
+      ansible.builtin.assert:
+        that:
+          - "'listen 80;' in (new_nginx_site.content | b64decode)"
+          - "'fastcgi_pass unix:/run/php/php8.5-fpm.sock;' in (new_nginx_site.content | b64decode)"
+          - "'listen 443 ssl;' not in (new_nginx_site.content | b64decode)"
+
+    - name: Seed source and remote-only state
+      ansible.builtin.copy:
+        dest: "{{ fixture.path }}/{{ item.path }}"
+        content: "{{ item.content }}"
+        mode: '0644'
+      loop:
+        - { path: source/index.php, content: new-code }
+        - { path: source/.git, content: source-worktree-git-file }
+        - { path: source/.env, content: source-env-placeholder }
+        - { path: source/nested/.git/config, content: source-submodule-git }
+        - { path: source/public/media/source.txt, content: source-media }
+        - { path: source/vendor/autoload.php, content: source-vendor }
+        - { path: source/storage/media/source.txt, content: source-media }
+        - { path: remote/index.php, content: old-code }
+        - { path: remote/.git, content: remote-worktree-git-file }
+        - { path: remote/.env, content: remote-env-placeholder }
+        - { path: remote/nested/.git/config, content: remote-submodule-git }
+        - { path: remote/public/media/upload.jpg, content: project-upload }
+        - { path: remote/vendor/autoload.php, content: remote-vendor }
+        - { path: remote/storage/media/upload.jpg, content: uploaded-media }
+        - { path: remote/obsolete.php, content: obsolete }
+
+    - name: Build the production rsync protection options
+      ansible.builtin.include_tasks: ../../roles/Deploy/tasks/rsync-options.yml
+
+    - name: Apply production rsync delete and protection rules to fixture
+      ansible.builtin.command:
+        argv: "{{ ['rsync', '-a', '--delete'] + deploy_rsync_opts + [fixture.path ~ '/source/', fixture.path ~ '/remote/'] }}"
+      changed_when: true
+
+    - name: Read updated application code and protected remote state
+      ansible.builtin.slurp:
+        src: "{{ fixture.path }}/remote/{{ item }}"
+      loop:
+        - index.php
+        - .env
+        - .git
+        - nested/.git/config
+        - vendor/autoload.php
+        - storage/media/upload.jpg
+        - public/media/upload.jpg
+      register: synced_files
+
+    - name: Verify code updates and persistent remote data survive
+      ansible.builtin.assert:
+        that:
+          - synced_files.results[0].content | b64decode == 'new-code'
+          - synced_files.results[1].content | b64decode == 'remote-env-placeholder'
+          - synced_files.results[2].content | b64decode == 'remote-worktree-git-file'
+          - synced_files.results[3].content | b64decode == 'remote-submodule-git'
+          - synced_files.results[4].content | b64decode == 'remote-vendor'
+          - synced_files.results[5].content | b64decode == 'uploaded-media'
+          - synced_files.results[6].content | b64decode == 'project-upload'
+
+    - name: Apply environment setup with the safe default against a pre-existing file
+      ansible.builtin.include_tasks: ../../roles/Deploy/tasks/environment.yml
+      vars:
+        remote_root_path: "{{ fixture.path }}/remote"
+        role_path: "{{ playbook_dir }}/../../roles/Deploy"
+        remote_root_owner: root
+        deploy_update_env: false
+        deploy_skip_readability_probe: true
+        application_name: fixture
+        application_env: testing
+        application_encryption_key: test-placeholder
+        application_debug: 'false'
+        application_url: https://fixture.invalid
+        sentry_laravel_dns: ''
+        sentry_traces_sample_rate: '0'
+        sentry_profiles_sample_rate: '0'
+        mysql_host: 127.0.0.1
+        mysql_port: 3306
+        mysql_database: fixture
+        mysql_username: fixture
+        mysql_password: test-placeholder
+        additional_env: 'EXTRA_TEST=rendered'
+
+    - name: Read the existing environment after default setup
+      ansible.builtin.slurp:
+        src: "{{ fixture.path }}/remote/.env"
+      register: preserved_env
+
+    - name: Confirm default setup preserves existing environment content
+      ansible.builtin.assert:
+        that:
+          - "'remote-env-placeholder' in (preserved_env.content | b64decode)"
+          - "'APP_NAME=fixture' not in (preserved_env.content | b64decode)"
+
+    - name: Apply environment setup only after explicit update opt-in
+      ansible.builtin.include_tasks: ../../roles/Deploy/tasks/environment.yml
+      vars:
+        remote_root_path: "{{ fixture.path }}/remote"
+        role_path: "{{ playbook_dir }}/../../roles/Deploy"
+        remote_root_owner: root
+        deploy_update_env: true
+        deploy_skip_readability_probe: true
+        application_name: fixture
+        application_env: testing
+        application_encryption_key: test-placeholder
+        application_debug: 'false'
+        application_url: https://fixture.invalid
+        sentry_laravel_dns: ''
+        sentry_traces_sample_rate: '0'
+        sentry_profiles_sample_rate: '0'
+        mysql_host: 127.0.0.1
+        mysql_port: 3306
+        mysql_database: fixture
+        mysql_username: fixture
+        mysql_password: test-placeholder
+        additional_env: 'EXTRA_TEST=rendered'
+
+    - name: Read environment after explicit update
+      ansible.builtin.slurp:
+        src: "{{ fixture.path }}/remote/.env"
+      register: updated_env
+
+    - name: Confirm explicit update generated the template without displaying values
+      ansible.builtin.assert:
+        that:
+          - "'APP_NAME=fixture' in (updated_env.content | b64decode)"
+          - "'EXTRA_TEST=rendered' in (updated_env.content | b64decode)"
+
+    - name: Confirm stale source-managed files are deleted
+      ansible.builtin.stat:
+        path: "{{ fixture.path }}/remote/obsolete.php"
+      register: obsolete_file
+
+    - name: Require stale file deletion
+      ansible.builtin.assert:
+        that:
+          - not obsolete_file.stat.exists
+
+    - name: Create final permissions fixture with unsafe mode
+      ansible.builtin.file:
+        path: "{{ fixture.path }}/remote/.env"
+        state: file
+        mode: '0755'
+
+    - name: Apply the production final permissions policy
+      ansible.builtin.include_tasks: ../../roles/Deploy/tasks/permissions.yml
+      vars:
+        remote_root_path: "{{ fixture.path }}/remote"
+        remote_root_owner: root
+        remote_root_group: root
+
+    - name: Inspect final environment file permissions
+      ansible.builtin.stat:
+        path: "{{ fixture.path }}/remote/.env"
+      register: final_env
+
+    - name: Require secure mode and group-read access for www-data
+      ansible.builtin.assert:
+        that:
+          - final_env.stat.mode == '0640'
+          - final_env.stat.gr_name == 'www-data'
+
+    - name: Assert deployment contracts remain fail-fast and scoped
+      ansible.builtin.assert:
+        that:
+          - "'ignore_errors' not in lookup('ansible.builtin.file', '../../roles/Deploy/tasks/setup.yml')"
+          - "'supervisorctl update ' in lookup('ansible.builtin.file', '../../roles/Deploy/tasks/setup.yml')"
+          - "'domain | replace' in lookup('ansible.builtin.file', '../../roles/Deploy/tasks/setup.yml')"
+          - "'php_fpm_daemon | default' in lookup('ansible.builtin.file', '../../roles/Php/handlers/main.yml')"
+          - "lookup('ansible.builtin.file', '../../roles/Deploy/tasks/main.yml').index('include_tasks: setup.yml') < lookup('ansible.builtin.file', '../../roles/Deploy/tasks/main.yml').index('migrate --force')"
+          - "lookup('ansible.builtin.file', '../../roles/Deploy/tasks/setup.yml').index('composer_path }} install') < lookup('ansible.builtin.file', '../../roles/Deploy/tasks/setup.yml').index('artisan package:discover')"
+          - "'recurse: yes' not in lookup('ansible.builtin.file', '../../roles/Deploy/tasks/upload.yml')"
+          - "'force: true' not in lookup('ansible.builtin.file', '../../roles/Nginx/tasks/main.yml')"
+          - "'state: latest' not in lookup('ansible.builtin.file', '../../roles/Nginx/tasks/main.yml')"
+          - "'nginx -t' in lookup('ansible.builtin.file', '../../roles/Nginx/handlers/main.yml')"
+          - "'state: reloaded' in lookup('ansible.builtin.file', '../../roles/Nginx/handlers/main.yml')"
+          - "'config.php' in lookup('ansible.builtin.file', '../../roles/Deploy/tasks/setup.yml')"
+          - "'services.php' in lookup('ansible.builtin.file', '../../roles/Deploy/tasks/setup.yml')"
+          - "'packages.php' in lookup('ansible.builtin.file', '../../roles/Deploy/tasks/setup.yml')"
+          - "'events.php' in lookup('ansible.builtin.file', '../../roles/Deploy/tasks/setup.yml')"
+          - "'deploy_update_env | default(false) | bool' in lookup('ansible.builtin.file', '../../roles/Deploy/tasks/environment.yml')"
+          - "'ignore_errors' not in lookup('ansible.builtin.file', '../../roles/Nginx/tasks/main.yml')"
+          - "'Refresh apt metadata after adding the Ubuntu PHP PPA' in lookup('ansible.builtin.file', '../../roles/Php/tasks/setup-Debian.yml')"
+          - "'ansible.builtin.apt:' in lookup('ansible.builtin.file', '../../roles/Php/tasks/setup-Debian.yml')"
+          - "'apt-get update --allow-releaseinfo-change' not in lookup('ansible.builtin.file', '../../roles/Yarn/tasks/main.yml')"
+
+    - name: Load selected Debian PHP service mapping
+      ansible.builtin.include_vars:
+        file: ../../roles/Php/vars/Debian.yml
+
+    - name: Confirm selected PHP-FPM handler service mapping
+      ansible.builtin.assert:
+        that:
+          - __php_fpm_daemon == 'php8.5-fpm'
+          - "'php_fpm_daemon | default(' in lookup('ansible.builtin.file', '../../roles/Php/handlers/main.yml')"
+
+    - name: Remove isolated deployment fixture
+      ansible.builtin.file:
+        path: "{{ fixture.path }}"
+        state: absent
+
+  handlers:
+    - name: Apply Nginx config safely
+      ansible.builtin.debug:
+        msg: Test fixture changed; production Nginx was not invoked.

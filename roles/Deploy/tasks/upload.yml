@@ -1,12 +1,14 @@
 ---
-- name: Make sure the remote app root exists and has the right permissions
+- name: Create the remote app root with restricted ownership
   ansible.builtin.file:
     path: "{{ remote_root_path }}"
     state: directory
     mode: '0755'
-    recurse: yes
     owner: "{{ remote_root_owner }}"
     group: "{{ remote_root_group }}"
+
+- name: Prepare safe rsync delete protection
+  ansible.builtin.include_tasks: rsync-options.yml
 
 - name: Rsync application files to the remote server
   ansible.posix.synchronize:
@@ -14,18 +16,22 @@
     dest: "{{ remote_root_path }}"
     recursive: true
     delete: true
-    rsync_opts:
-      - "--no-motd"
-      - "--exclude=.git,vendor,tests,storage/logs/*,storage/framework/sessions/*,storage/framework/cache/*"
+    rsync_opts: "{{ deploy_rsync_opts }}"
 
-- name: Make sure the remote app root has the right permissions
+- name: Ensure Laravel writable directories exist
   ansible.builtin.file:
-    path: "{{ remote_root_path }}"
+    path: "{{ item }}"
     state: directory
     mode: '0755'
-    recurse: yes
     owner: "{{ remote_root_owner }}"
     group: "{{ remote_root_group }}"
+  loop:
+    - "{{ remote_storage_path }}/app/public"
+    - "{{ remote_storage_path }}/framework/cache/data"
+    - "{{ remote_storage_path }}/framework/sessions"
+    - "{{ remote_storage_path }}/framework/views"
+    - "{{ remote_storage_path }}/logs"
+    - "{{ remote_root_path }}/bootstrap/cache"
 
 - name: Set up additional directory permissions for www-data user on storage folder
   ansible.posix.acl:

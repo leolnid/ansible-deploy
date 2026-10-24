@@ -1,0 +1,182 @@
+---
+# Run only in a disposable Debian container. The test uses a private
+# update-alternatives database and never changes the host's PHP alternatives.
+- name: Fresh host keeps the new PHP version in automatic mode
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  tasks:
+    - name: Create isolated alternatives state
+      ansible.builtin.tempfile:
+        state: directory
+        suffix: php-alt-fresh
+      register: php_alt_test_root
+
+    - name: Create isolated alternatives directories
+      ansible.builtin.file:
+        path: "{{ php_alt_test_root.path }}/{{ item }}"
+        state: directory
+      loop:
+        - admin
+        - links
+        - bin
+        - candidates
+
+    - name: Configure isolated alternatives database
+      ansible.builtin.set_fact:
+        php_alternatives_command_args:
+          - --admindir
+          - "{{ php_alt_test_root.path }}/admin"
+          - --altdir
+          - "{{ php_alt_test_root.path }}/links"
+        php_alternative_groups:
+          - php
+
+    - name: Create PHP 8.5 candidate
+      ansible.builtin.copy:
+        dest: "{{ php_alt_test_root.path }}/candidates/php8.5"
+        content: "#!/bin/sh\necho PHP 8.5.0\n"
+        mode: '0755'
+
+    - name: Confirm no PHP alternative exists before a fresh installation
+      ansible.builtin.command:
+        argv: "{{ ['update-alternatives'] + php_alternatives_command_args + ['--query', 'php'] }}"
+      register: fresh_php_before
+      changed_when: false
+      failed_when: false
+
+    - name: Require an empty PHP alternatives group
+      ansible.builtin.assert:
+        that:
+          - fresh_php_before.rc != 0
+
+    - name: Apply the preservation task to an empty host
+      ansible.builtin.include_tasks: ../../roles/Php/tasks/preserve-alternatives.yml
+
+    - name: Register PHP 8.5 as installed by apt on a fresh host
+      ansible.builtin.command:
+        argv: >-
+          {{ ['update-alternatives'] + php_alternatives_command_args +
+             ['--install', php_alt_test_root.path + '/bin/php', 'php',
+              php_alt_test_root.path + '/candidates/php8.5', '85'] }}
+      changed_when: true
+
+    - name: Query the fresh host PHP alternative
+      ansible.builtin.command:
+        argv: "{{ ['update-alternatives'] + php_alternatives_command_args + ['--query', 'php'] }}"
+      register: fresh_php_after
+      changed_when: false
+
+    - name: Confirm PHP 8.5 is selected automatically on a fresh host
+      ansible.builtin.assert:
+        that:
+          - "'Status: auto' in fresh_php_after.stdout_lines"
+          - "('Value: ' ~ php_alt_test_root.path ~ '/candidates/php8.5') in fresh_php_after.stdout_lines"
+
+    - name: Remove isolated fresh host fixture
+      ansible.builtin.file:
+        path: "{{ php_alt_test_root.path }}"
+        state: absent
+
+- name: Existing defaults stay pinned while PHP 8.5 is installed
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  tasks:
+    - name: Create isolated alternatives state
+      ansible.builtin.tempfile:
+        state: directory
+        suffix: php-alt-existing
+      register: php_alt_test_root
+
+    - name: Create isolated alternatives directories
+      ansible.builtin.file:
+        path: "{{ php_alt_test_root.path }}/{{ item }}"
+        state: directory
+      loop:
+        - admin
+        - links
+        - bin
+        - candidates
+
+    - name: Configure isolated alternatives database
+      ansible.builtin.set_fact:
+        php_alternatives_command_args:
+          - --admindir
+          - "{{ php_alt_test_root.path }}/admin"
+          - --altdir
+          - "{{ php_alt_test_root.path }}/links"
+        php_alternative_groups:
+          - php
+          - phar
+          - phar.phar
+          - phpize
+          - php-config
+          - php-fpm.sock
+
+    - name: Create old and new PHP candidates
+      ansible.builtin.copy:
+        dest: "{{ php_alt_test_root.path }}/candidates/{{ item }}"
+        content: "#!/bin/sh\necho {{ item }}\n"
+        mode: '0755'
+      loop:
+        - php8.2
+        - phar8.2
+        - phar-phar8.2
+        - phpize8.2
+        - php-config8.2
+        - fpm8.2
+        - php8.5
+        - phar8.5
+        - phar-phar8.5
+        - phpize8.5
+        - php-config8.5
+        - fpm8.5
+
+    - name: Register PHP 8.2 defaults as automatic alternatives
+      ansible.builtin.command:
+        argv: >-
+          {{ ['update-alternatives'] + php_alternatives_command_args +
+             ['--install', php_alt_test_root.path + '/bin/' + item.name,
+              item.name, php_alt_test_root.path + '/candidates/' + item.old, '82'] }}
+      loop:
+        - { name: php, old: php8.2 }
+        - { name: phar, old: phar8.2 }
+        - { name: phar.phar, old: phar-phar8.2 }
+        - { name: phpize, old: phpize8.2 }
+        - { name: php-config, old: php-config8.2 }
+        - { name: php-fpm.sock, old: fpm8.2 }
+      changed_when: true
+
+    - name: Put one existing group in manual mode
+      ansible.builtin.command:
+        argv: >-
+          {{ ['update-alternatives'] + php_alternatives_command_args +
+             ['--set', 'phar', php_alt_test_root.path + '/candidates/phar8.2'] }}
+      changed_when: true
+
+    - name: Capture and pin automatic defaults before the PHP 8.5 install
+      ansible.builtin.include_tasks: ../../roles/Php/tasks/preserve-alternatives.yml
+
+    - name: Simulate apt registering PHP 8.5 alternatives
+      ansible.builtin.command:
+        argv: >-
+          {{ ['update-alternatives'] + php_alternatives_command_args +
+             ['--install', php_alt_test_root.path + '/bin/' + item.name,
+              item.name, php_alt_test_root.path + '/candidates/' + item.new, '85'] }}
+      loop:
+        - { name: php, new: php8.5 }
+        - { name: phar, new: phar8.5 }
+        - { name: phar.phar, new: phar-phar8.5 }
+        - { name: phpize, new: phpize8.5 }
+        - { name: php-config, new: php-config8.5 }
+        - { name: php-fpm.sock, new: fpm8.5 }
+      changed_when: true
+
+    - name: Verify existing PHP defaults after package installation
+      ansible.builtin.include_tasks: ../../roles/Php/tasks/verify-alternatives.yml
+
+    - name: Remove isolated existing host fixture
+      ansible.builtin.file:
+        path: "{{ php_alt_test_root.path }}"
+        state: absent

@@ -1,0 +1,22 @@
+---
+- name: Query existing PHP alternatives
+  ansible.builtin.command:
+    argv: "{{ ['update-alternatives'] + php_alternatives_command_args + ['--query', item] }}"
+  loop: "{{ php_alternative_groups }}"
+  register: php_alternatives_before
+  changed_when: false
+  failed_when: false
+
+- name: Pin current automatic PHP alternatives before apt can change them
+  ansible.builtin.command:
+    argv: >-
+      {{ ['update-alternatives'] + php_alternatives_command_args +
+         ['--set', item.item, ((item.stdout_lines | select('match', '^Value: /') | first | default('Value: ')) | regex_replace('^Value: ', ''))] }}
+  loop: "{{ php_alternatives_before.results }}"
+  when:
+    - item.rc == 0
+    - "'Status: auto' in item.stdout_lines"
+    - "(item.stdout_lines | select('match', '^Value: /') | list | length) > 0"
+  changed_when: true
+
+\n

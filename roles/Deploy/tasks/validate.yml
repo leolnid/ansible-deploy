@@ -1,0 +1,49 @@
+# Validate protected variables before upload.yml or any other deploy mutation.
+- name: Validate required deploy variables
+  ansible.builtin.assert:
+    that:
+      - application is string and (application | length) > 0
+      - root_domain is string and (root_domain | length) > 0
+      - domain is string and (domain | length) > 0
+      - not (domain | regex_search('^\\.'))
+      - mysql_database is string and (mysql_database | length) > 0
+      - mysql_username is string and (mysql_username | length) > 0
+      - mysql_password is string and (mysql_password | length) > 0
+      - application_encryption_key is string and (application_encryption_key | length) > 0
+      - php_cli_binary is string and php_cli_binary is match('^/[^\s]+$')
+      - php_fpm_socket is string and php_fpm_socket is match('^/[^\s]+$')
+    fail_msg: >-
+      Missing required CI env for domain='{{ domain }}'
+      (PREFIX/ROOT_DOMAIN/MYSQL_DATABASE/MYSQL_USERNAME/MYSQL_PASSWORD/ENCRYPTION_KEY).
+      Protected GitLab variables are NOT injected on unprotected branches —
+      unprotect them or run from a protected branch. Refusing to change the server.
+
+- name: Check selected PHP CLI runtime
+  ansible.builtin.command:
+    argv:
+      - "{{ php_cli_binary }}"
+      - --version
+  register: php_cli_version_check
+  changed_when: false
+
+- name: Confirm selected PHP CLI matches PHP_VERSION
+  ansible.builtin.assert:
+    that:
+      - "('PHP ' ~ php_version ~ '.') in php_cli_version_check.stdout"
+    fail_msg: Selected PHP CLI does not match configured PHP_VERSION.
+
+- name: Check selected PHP-FPM socket
+  ansible.builtin.command:
+    argv:
+      - test
+      - -S
+      - "{{ php_fpm_socket }}"
+  register: php_fpm_socket_check
+  changed_when: false
+  failed_when: false
+
+- name: Confirm selected PHP-FPM socket is active
+  ansible.builtin.assert:
+    that:
+      - php_fpm_socket_check.rc == 0
+    fail_msg: Selected PHP-FPM socket is missing or inactive; refusing to change the server.

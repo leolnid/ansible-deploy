@@ -1,0 +1,33 @@
+---
+- name: Validate project-specific persistent rsync paths
+  ansible.builtin.assert:
+    that:
+      - item is string
+      - item | length > 0
+      - not item.startswith('/')
+      - "'..' not in item.split('/')"
+      - not (item is search('[\\s,]'))
+    fail_msg: deploy_preserve_paths entries must be relative paths without whitespace or commas.
+  loop: "{{ deploy_preserve_paths | default([]) }}"
+
+- name: Initialize rsync deletion protection rules
+  ansible.builtin.set_fact:
+    deploy_rsync_opts:
+      - "--no-motd"
+      - "--exclude=/.git"
+      - "--filter=P /.git"
+      - "--exclude=/**/.git"
+      - "--filter=P /**/.git"
+      - "--exclude=/.env"
+      - "--filter=P /.env"
+      - "--exclude=/vendor/"
+      - "--filter=P /vendor/"
+      - "--exclude=/storage/"
+      - "--filter=P /storage/"
+      - "--exclude=/tests/"
+      - "--filter=P /tests/"
+
+- name: Add project-specific persistent paths to rsync protection
+  ansible.builtin.set_fact:
+    deploy_rsync_opts: "{{ deploy_rsync_opts + ['--exclude=/' ~ item, '--filter=P /' ~ item] }}"
+  loop: "{{ deploy_preserve_paths | default([]) }}"

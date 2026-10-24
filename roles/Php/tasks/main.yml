@@ -37,6 +37,25 @@
   set_fact:
     php_install_recommends: "{{ php_versions_install_recommends }}"
 
+- name: Validate selected PHP runtime paths
+  ansible.builtin.assert:
+    that:
+      - php_cli_binary is string and php_cli_binary is match('^/[^\s]+$')
+      - php_fpm_socket is string and php_fpm_socket is match('^/[^\s]+$')
+    fail_msg: PHP_CLI_BINARY and PHP_FPM_SOCKET must resolve to absolute paths without whitespace.
+
+- name: Configure OS-specific PHP repositories before package installation
+  ansible.builtin.include_tasks: "setup-{{ ansible_os_family }}.yml"
+
+- name: Preserve existing Debian PHP alternatives before package installation
+  ansible.builtin.include_tasks: preserve-alternatives.yml
+  when: ansible_os_family == 'Debian'
+
+- name: Install PHP from the Ubuntu standard repository when the PPA is unavailable
+  ansible.builtin.include_tasks: fallback-Ubuntu.yml
+  when:
+    - ansible_distribution == 'Ubuntu'
+    - php_use_ubuntu_standard_php_fallback | default(false) | bool
 
 - name: Install PHP Modules / Extensions
   apt:
@@ -45,6 +64,6 @@
     state: latest
   loop: "{{ php_packages }}"
 
-
-# Setup tasks.
-- include_tasks: "setup-{{ ansible_os_family }}.yml"
+- name: Verify existing Debian PHP alternatives after package installation
+  ansible.builtin.include_tasks: verify-alternatives.yml
+  when: ansible_os_family == 'Debian'

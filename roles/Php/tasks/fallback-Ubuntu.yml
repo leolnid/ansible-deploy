@@ -1,0 +1,15 @@
+---
+- name: Remove failed Ubuntu PHP PPA
+  ansible.builtin.file:
+    path: /etc/apt/sources.list.d/ondrej-php.list
+    state: absent
+
+- name: Install PHP from the Ubuntu standard repository
+  ansible.builtin.apt:
+    name: "php{{ php_version }}"
+    state: present
+    update_cache: no
+
+- name: Report use of the Ubuntu standard PHP repository
+  ansible.builtin.debug:
+    msg: "Using Ubuntu standard PHP repository for PHP {{ php_version }}."

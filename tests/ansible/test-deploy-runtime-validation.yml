@@ -1,0 +1,64 @@
+---
+# Run in a disposable Debian container; this validates the explicit per-site
+# PHP_CLI_BINARY and PHP_FPM_SOCKET override path through the real deploy guard.
+- hosts: localhost
+  connection: local
+  gather_facts: false
+  vars:
+    application: runtime-test
+    root_domain: example.test
+    domain: runtime-test.example.test
+    mysql_database: runtime_test
+    mysql_username: runtime_test
+    mysql_password: placeholder-for-test-only
+    application_encryption_key: placeholder-for-test-only
+    php_version: '8.5'
+  tasks:
+    - name: Create isolated runtime fixture
+      ansible.builtin.tempfile:
+        state: directory
+        suffix: php-runtime-validation
+      register: php_runtime_test_root
+
+    - name: Configure valid custom runtime overrides
+      ansible.builtin.set_fact:
+        php_cli_binary: "{{ php_runtime_test_root.path }}/php8.5"
+        php_fpm_socket: "{{ php_runtime_test_root.path }}/custom-fpm.sock"
+
+    - name: Create custom PHP CLI executable
+      ansible.builtin.copy:
+        dest: "{{ php_cli_binary }}"
+        content: "#!/bin/sh\necho 'PHP 8.5.0 test'\n"
+        mode: '0755'
+
+    - name: Create custom PHP-FPM Unix socket fixture
+      ansible.builtin.command:
+        argv:
+          - python3
+          - -c
+          - "import socket; s=socket.socket(socket.AF_UNIX); s.bind('{{ php_fpm_socket }}'); s.listen(1)"
+      changed_when: true
+
+    - name: Validate configured custom runtime paths
+      ansible.builtin.include_tasks: ../../roles/Deploy/tasks/validate.yml
+
+    - name: Confirm relative CLI override is rejected
+      block:
+        - name: Run the deploy guard with a relative CLI override
+          ansible.builtin.include_tasks: ../../roles/Deploy/tasks/validate.yml
+          vars:
+            php_cli_binary: php8.5
+      rescue:
+        - name: Record expected validation rejection
+          ansible.builtin.set_fact:
+            relative_cli_override_rejected: true
+
+    - name: Require rejection of unsafe CLI override
+      ansible.builtin.assert:
+        that:
+          - relative_cli_override_rejected | default(false)
+
+    - name: Remove isolated runtime fixture
+      ansible.builtin.file:
+        path: "{{ php_runtime_test_root.path }}"
+        state: absent

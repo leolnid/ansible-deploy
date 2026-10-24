@@ -1,10 +1,11 @@
 ---
-- name: Reload Nginx
-  service:
+- name: Test Nginx configuration before reload
+  ansible.builtin.command: nginx -t
+  changed_when: false
+  listen: Apply Nginx config safely
+
+- name: Gracefully reload Nginx after config validation
+  ansible.builtin.service:
     name: nginx
     state: reloaded
-
-- name: Restart Nginx
-  service:
-    name: nginx
-    state: restarted
+  listen: Apply Nginx config safely

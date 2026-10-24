@@ -6,7 +6,7 @@
 
 - name: Run Composer Installer (if not already installed)
   ansible.builtin.command:
-    cmd: /usr/bin/php /tmp/composer-setup.php
+    cmd: "{{ php_cli_binary }} /tmp/composer-setup.php"
     creates: composer.phar
 
 - name: Copy Composer Executable to /usr/local/bin
