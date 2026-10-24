@@ -26,6 +26,10 @@
       - "--filter=P /storage/"
       - "--exclude=/tests/"
       - "--filter=P /tests/"
+      - "--exclude=/packages/leolnid/common-deploy/ansible.key"
+      - "--filter=P /packages/leolnid/common-deploy/ansible.key"
+      - "--exclude=/packages/leolnid/common-deploy/inventory"
+      - "--filter=P /packages/leolnid/common-deploy/inventory"
 
 - name: Add project-specific persistent paths to rsync protection
   ansible.builtin.set_fact:

@@ -112,6 +112,12 @@
           - "'fastcgi_pass unix:/run/php/php8.5-fpm.sock;' in (new_nginx_site.content | b64decode)"
           - "'listen 443 ssl;' not in (new_nginx_site.content | b64decode)"
 
+    - name: Create transient CI metadata fixture directory
+      ansible.builtin.file:
+        path: "{{ fixture.path }}/source/packages/leolnid/common-deploy"
+        state: directory
+        mode: '0755'
+
     - name: Seed source and remote-only state
       ansible.builtin.copy:
         dest: "{{ fixture.path }}/{{ item.path }}"
@@ -125,6 +131,8 @@
         - { path: source/public/media/source.txt, content: source-media }
         - { path: source/vendor/autoload.php, content: source-vendor }
         - { path: source/storage/media/source.txt, content: source-media }
+        - { path: source/packages/leolnid/common-deploy/ansible.key, content: fake-ci-key-placeholder }
+        - { path: source/packages/leolnid/common-deploy/inventory, content: fake-ci-inventory-placeholder }
         - { path: remote/index.php, content: old-code }
         - { path: remote/.git, content: remote-worktree-git-file }
         - { path: remote/.env, content: remote-env-placeholder }
@@ -243,6 +251,20 @@
       ansible.builtin.assert:
         that:
           - not obsolete_file.stat.exists
+
+    - name: Inspect exact CI-only files after application upload
+      ansible.builtin.stat:
+        path: "{{ fixture.path }}/remote/packages/leolnid/common-deploy/{{ item }}"
+      loop:
+        - ansible.key
+        - inventory
+      register: ci_only_files
+
+    - name: Ensure CI-only key and inventory never reach the application root
+      ansible.builtin.assert:
+        that:
+          - not item.stat.exists
+      loop: "{{ ci_only_files.results }}"
 
     - name: Create final permissions fixture with unsafe mode
       ansible.builtin.file:
