@@ -105,3 +105,20 @@ The reviewed profile must specify `fpm_pool`, `fpm_status_path` and the existing
 `fpm_status_socket` under a root-owned 0700 parent. It is a private FastCGI status
 listener, never a public Nginx endpoint. Status enrollment is a separately
 reviewed infrastructure change and is not inferred or performed by this role.
+
+## Pinned common source and verified LFS assets
+
+The builder accepts `--common-checkout` only for the existing
+`packages/leolnid/common` Gitlink. It materializes the exact commit from the
+application tree, reading Git objects rather than the checkout HEAD or dirty
+files. An absent, unused, nested or unsupported Gitlink is refused before an
+artifact is created. This option does not resolve or update dependencies.
+
+Git LFS pointers are materialized only from an existing LFS object or hydrated
+file whose SHA-256 OID and byte length both match. Missing or mismatched content
+is refused before artifact creation. The manifest hashes the actual binary
+content and records the pinned common commit and LFS object metadata.
+
+A standalone Supervisor selector is accepted only by its exact configured
+name when the reviewed group expects exactly one process. Multi-process groups
+still require their exact `group:process` selectors. Redis remains unsupported.

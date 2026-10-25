@@ -169,7 +169,7 @@ class ExistingRelease:
             selected = []
             for line in data.splitlines():
                 fields = line.split()
-                if len(fields) < 2 or not fields[0].startswith(group + ':'):
+                if len(fields) < 2 or not (fields[0].startswith(group + ':') or count == 1 and fields[0] == group):
                     raise Refuse('unexpected_supervisor_status')
                 m = re.search(r'\bpid (\d+)', line)
                 selected.append((fields[0], fields[1], int(m[1]) if m else 0))

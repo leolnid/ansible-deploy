@@ -137,6 +137,16 @@ class ContractTests(unittest.TestCase):
         with mock.patch.object(r,'public_codes',return_value=temporary),mock.patch('time.sleep'),mock.patch('time.monotonic',side_effect=[0,1,20]):
             with self.assertRaises(m.Refuse):r.await_public_baseline('fixture_failed')
         self.assertEqual(r.report['fixture_failed'],[temporary])
+    def test_exact_standalone_supervisor_selector_only_for_single_process(self):
+        r=self.release();line=b'fixture RUNNING pid 1234, uptime 0:10:00\n'
+        with mock.patch.object(r,'run',return_value=line):
+            result=m.ExistingRelease.statuses(r);self.assertEqual(result,{'fixture':{'state':'RUNNING','pid':1234}})
+        for invalid in [b'fixture-other RUNNING pid 1234, uptime 0:10:00\n',line+line]:
+            with mock.patch.object(r,'run',return_value=invalid):
+                with self.assertRaises(m.Refuse):m.ExistingRelease.statuses(r)
+        r.p['worker_groups']['fixture']=2
+        with mock.patch.object(r,'run',return_value=line):
+            with self.assertRaises(m.Refuse):m.ExistingRelease.statuses(r)
     def test_public_alias_symlink_is_not_replaced(self):
         alias=self.base/'public-app';alias.symlink_to(self.live);self.profile['application_root']=str(alias);inode=alias.lstat().st_ino;r=self.release();self.apply(r);self.assertEqual(alias.lstat().st_ino,inode);self.assertEqual(alias.resolve(),self.live)
     def test_config_failure_restores_old_cache_and_source(self):
