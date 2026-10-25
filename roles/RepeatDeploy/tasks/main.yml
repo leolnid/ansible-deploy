@@ -1,0 +1,54 @@
+---
+- name: Require an explicit existing-app profile and local release artifact
+  ansible.builtin.assert:
+    that:
+      - not ansible_check_mode
+      - ansible_play_hosts_all | length == 1
+      - repeat_deploy_profile is mapping
+      - repeat_deploy_profile.schema_version | int == 1
+      - repeat_deploy_profile.application_root is string
+      - repeat_deploy_source_archive is string
+      - repeat_deploy_source_archive | length > 0
+      - repeat_deploy_profile_path is not defined
+    fail_msg: RepeatDeploy requires a reviewed secret-free profile and source artifact; provisioning is never inferred.
+
+- name: Create a private deployment control directory
+  ansible.builtin.tempfile:
+    state: directory
+    prefix: amorenat-repeat-
+  register: repeat_deploy_control
+
+- name: Protect deployment control files
+  ansible.builtin.file:
+    path: "{{ repeat_deploy_control.path }}"
+    state: directory
+    mode: '0700'
+
+- name: Upload the reviewed existing-app executor
+  ansible.builtin.copy:
+    src: repeat_deploy.py
+    dest: "{{ repeat_deploy_control.path }}/repeat_deploy.py"
+    mode: '0600'
+
+- name: Upload the secret-free runtime profile
+  ansible.builtin.copy:
+    content: "{{ repeat_deploy_profile | to_json }}"
+    dest: "{{ repeat_deploy_control.path }}/profile.json"
+    mode: '0600'
+  no_log: true
+
+- name: Upload the source artifact without touching the live root
+  ansible.builtin.copy:
+    src: "{{ repeat_deploy_source_archive }}"
+    dest: "{{ repeat_deploy_control.path }}/source.tar.gz"
+    mode: '0600'
+
+- name: Run an existing-app release with explicit apply control
+  ansible.builtin.command:
+    argv: "{{ ['/usr/bin/python3', repeat_deploy_control.path ~ '/repeat_deploy.py', '--profile', repeat_deploy_control.path ~ '/profile.json', '--archive', repeat_deploy_control.path ~ '/source.tar.gz'] + ((repeat_deploy_apply | default(false) | bool) | ternary(['--apply'], [])) }}"
+  register: repeat_deploy_result
+  changed_when: repeat_deploy_apply | default(false) | bool
+
+- name: Show only the sanitized deployment receipt
+  ansible.builtin.debug:
+    var: repeat_deploy_result.stdout

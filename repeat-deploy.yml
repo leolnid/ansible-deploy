@@ -1,0 +1,9 @@
+---
+# Existing application only. Does not include the provisioning or legacy Deploy roles.
+- name: Repeat a reviewed existing application release
+  hosts: all
+  become: true
+  gather_facts: false
+  serial: 1
+  roles:
+    - role: RepeatDeploy

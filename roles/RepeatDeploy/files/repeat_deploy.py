@@ -1,0 +1,951 @@
+#!/usr/bin/env python3
+"""Existing-app release executor. Output is metadata only; never config values.
+
+No provisioning, migrations, asset build, environment rewrite, global restart,
+cache flush or topology generation is part of this executor.
+"""
+from __future__ import annotations
+import argparse, copy, datetime, fcntl, hashlib, json, os, pathlib, re, secrets
+import shutil, signal, stat, subprocess, sys, tarfile, time, pwd
+
+class Refuse(RuntimeError):
+    pass
+
+def sha(data):
+    return hashlib.sha256(data).hexdigest()
+
+def digest(path):
+    return sha(pathlib.Path(path).read_bytes())
+
+def path_value(value):
+    if not isinstance(value, str) or not value.startswith('/') or any(c in value for c in '\n\r\0'):
+        raise Refuse('invalid_absolute_path')
+    p = pathlib.Path(value)
+    if '..' in p.parts or p == pathlib.Path('/'):
+        raise Refuse('unsafe_absolute_path')
+    return p
+
+def source_path(value):
+    if not isinstance(value, str) or not value or value.startswith('/') or '..' in pathlib.PurePosixPath(value).parts or '\\' in value:
+        raise Refuse('unsafe_source_path')
+    return value
+
+def validate_profile(p):
+    if not isinstance(p, dict) or p.get('schema_version') != 1:
+        raise Refuse('unsupported_profile_schema')
+    required = ['project', 'application_root', 'php_cli', 'php_minor', 'fpm_socket',
+                'nginx_config', 'server_names', 'public_baselines', 'worker_groups',
+                'supervisor_config_hashes', 'live_manifest', 'candidate_manifest',
+                'source_archive_sha256', 'backup_reference', 'server_identity_sha256']
+    if any(k not in p for k in required):
+        raise Refuse('incomplete_profile')
+    if not re.fullmatch(r'[a-z0-9][a-z0-9-]{0,63}', p['project']):
+        raise Refuse('invalid_project')
+    for name in ['application_root', 'php_cli', 'fpm_socket', 'nginx_config']:
+        path_value(p[name])
+    if not any(p['application_root'].startswith(root) for root in ['/var/www/', '/home/user/www/', '/srv/']):
+        raise Refuse('application_root_outside_supported_scope')
+    if not p['nginx_config'].startswith('/etc/nginx/'):
+        raise Refuse('nginx_scope_required')
+    if not re.fullmatch(r'8\.[0-9]+', p['php_minor']):
+        raise Refuse('explicit_php_minor_required')
+    if not isinstance(p['server_names'], list) or not p['server_names'] or len(set(p['server_names'])) != len(p['server_names']):
+        raise Refuse('invalid_owned_server_names')
+    for host in p['server_names']:
+        if not re.fullmatch(r'[a-z0-9][a-z0-9.-]{0,252}[a-z0-9]', host) or '..' in host:
+            raise Refuse('wildcard_or_invalid_server_name')
+        baseline = p['public_baselines'].get(host)
+        if not isinstance(baseline, dict) or set(baseline) != {'80', '443'} or any(type(x) is not int or not 200 <= x < 500 for x in baseline.values()):
+            raise Refuse('explicit_readonly_baseline_required')
+    if not isinstance(p['worker_groups'], dict) or not p['worker_groups']:
+        raise Refuse('owned_worker_groups_required')
+    for group, count in p['worker_groups'].items():
+        if not re.fullmatch(r'[A-Za-z0-9_.-]{1,128}', group) or type(count) is not int or not 1 <= count <= 64:
+            raise Refuse('invalid_worker_group')
+    for name, value in p['supervisor_config_hashes'].items():
+        if not name.startswith('/etc/supervisor/conf.d/') or not name.endswith('.conf') or not re.fullmatch(r'[0-9a-f]{64}', value):
+            raise Refuse('invalid_supervisor_scope')
+    if not re.fullmatch(r'[0-9a-f]{64}', p['server_identity_sha256']):
+        raise Refuse('server_identity_required')
+    for name in ['live_manifest', 'candidate_manifest']:
+        m = p[name]
+        if not isinstance(m, dict) or not re.fullmatch(r'[0-9a-f]{40,64}', m.get('candidate_commit', '')) or not m.get('files'):
+            raise Refuse('source_manifest_required')
+        for rel, value in m['files'].items():
+            source_path(rel)
+            if not re.fullmatch(r'[0-9a-f]{64}', value):
+                raise Refuse('invalid_source_digest')
+    if not re.fullmatch(r'[0-9a-f]{64}', p['source_archive_sha256']) or not isinstance(p['backup_reference'], str) or not p['backup_reference']:
+        raise Refuse('artifact_and_existing_backup_required')
+    for key, pair in p.get('config_change_hashes', {}).items():
+        if not re.fullmatch(r'[A-Za-z0-9_.-]{1,200}', key) or key.split('.')[0] in ['database','queue','cache','session'] or key in ['app.key','app.env','app.debug','app.url'] or re.search(r'password|secret|token|credentials|coordination|concurrency',key,re.I):
+            raise Refuse('protected_configuration_delta_forbidden')
+        if not isinstance(pair,dict) or set(pair)!={'old','new'} or any(not re.fullmatch(r'[0-9a-f]{64}',h) for h in pair.values()):
+            raise Refuse('exact_typed_configuration_delta_hashes_required')
+    if 'fpm_status_socket' in p:
+        if not str(path_value(p['fpm_status_socket'])).startswith('/run/'):
+            raise Refuse('private_runtime_status_socket_required')
+    if 'fpm_status_path' in p and not re.fullmatch(r'/[A-Za-z0-9_/-]{1,100}',p['fpm_status_path']):
+        raise Refuse('invalid_existing_fpm_status_path')
+    if 'fpm_pool' in p and not re.fullmatch(r'[A-Za-z0-9_.-]{1,100}',p['fpm_pool']):
+        raise Refuse('invalid_existing_fpm_pool')
+    for value in p.get('same_inode_config_paths',[]):
+        if not re.fullmatch(r'[A-Za-z0-9_.-]{1,200}',value):
+            raise Refuse('explicit_config_path_required')
+    for rel in p.get('preserve_copy_paths', []) + p.get('preserve_link_paths', []):
+        source_path(rel)
+        if rel.split('/')[0] in ['.env', 'storage', 'vendor', 'bootstrap']:
+            raise Refuse('protected_paths_are_not_optional_preserve_paths')
+    for key, default in [('drain_timeout',120),('start_timeout',35)]:
+        if type(p.get(key,default)) not in [int,float] or not 0 < p.get(key,default) <= 600:
+            raise Refuse('invalid_bounded_timeout')
+    if type(p.get('minimum_free_bytes',1024**3)) is not int or p.get('minimum_free_bytes',1024**3) < 0:
+        raise Refuse('invalid_free_space_reserve')
+    allowed = set(required) | {'schema_version','cron_user','preserve_copy_paths','preserve_link_paths','same_inode_config_paths','drain_timeout','start_timeout','minimum_free_bytes','config_change_hashes','fpm_status_path','fpm_pool','fpm_status_socket'}
+    if set(p) - allowed:
+        raise Refuse('unknown_profile_field')
+    forbidden = ['run_migrations', 'run_seeders', 'build_assets', 'manage_supervisor', 'manage_cron', 'update_env', 'flush_live_cache', 'setup_server']
+    if any(p.get(k) for k in forbidden):
+        raise Refuse('provisioning_or_business_mutation_not_supported')
+    return p
+
+class ExistingRelease:
+    def __init__(self, profile, archive):
+        self.p = copy.deepcopy(validate_profile(profile))
+        self.entry = path_value(profile['application_root'])
+        self.root = self.entry.resolve(strict=True)
+        if not any(str(self.root).startswith(prefix) for prefix in ['/var/www/','/home/user/www/','/srv/']):
+            raise Refuse('resolved_application_root_outside_scope')
+        self.archive = pathlib.Path(archive)
+        self.phase = 'preflight'
+        self.stage = None
+        self.old_root = None
+        self.cron_paused = False
+        self.gated = False
+        self.swapped = False
+        self.old_moved = False
+        self.workers_stopped = False
+        self.pause_requested = False
+        self.report = {'project': profile['project'], 'candidate_sha': profile['candidate_manifest']['candidate_commit'], 'database_changes': False, 'notifications_sent': 0, 'manual_business_requests': 0}
+
+    def run(self, args, *, input=None, cwd=None, timeout=40, allowed=(0,), env=None, umask=None):
+        q = subprocess.run(args, input=input, cwd=cwd, env=env, capture_output=True, timeout=timeout, umask=-1 if umask is None else umask)
+        if q.returncode not in allowed:
+            raise Refuse('command_failed_' + pathlib.Path(args[0]).name)
+        return q.stdout
+
+    def checkpoint(self):
+        if self.control is not None:
+            target = self.control / 'receipt.json'
+            target.write_text(json.dumps({**self.report, 'phase': self.phase}, indent=2))
+            target.chmod(0o600)
+
+    def php(self, code, args=(), *, cache=None, bootstrap=False):
+        argv = [self.p['php_cli'], '-d', 'display_errors=0', '-r', code, *map(str, args)]
+        if hasattr(self, 'uid'):
+            env_args = ['APP_CONFIG_CACHE=' + str(cache)] if cache is not None else []
+            argv = ['sudo', '-u', '#' + str(self.uid), 'env', *env_args, *argv]
+        return self.run(argv)
+
+    def config(self, root):
+        code = "$c=require $argv[1].'/bootstrap/cache/config.php';echo json_encode($c,JSON_THROW_ON_ERROR);"
+        return json.loads(self.php(code, [root]))
+
+    def manifest(self, root, manifest):
+        for rel, expected in manifest['files'].items():
+            path = root / source_path(rel)
+            if not path.is_file():
+                raise Refuse('missing_manifest_file')
+            data = path.read_bytes()
+            if manifest.get('normalization_by_path', {}).get(rel) == 'crlf_to_lf':
+                data = data.replace(b'\r\n', b'\n')
+            if sha(data) != expected:
+                raise Refuse('source_manifest_drift')
+
+    def statuses(self):
+        rows = {}
+        for group, count in self.p['worker_groups'].items():
+            data = self.run(['supervisorctl', 'status', group + ':*'], allowed=(0, 3)).decode()
+            selected = []
+            for line in data.splitlines():
+                fields = line.split()
+                if len(fields) < 2 or not fields[0].startswith(group + ':'):
+                    raise Refuse('unexpected_supervisor_status')
+                m = re.search(r'\bpid (\d+)', line)
+                selected.append((fields[0], fields[1], int(m[1]) if m else 0))
+            if len(selected) != count:
+                raise Refuse('supervisor_topology_drift')
+            rows.update({name: {'state': state, 'pid': pid} for name, state, pid in selected})
+        return rows
+
+    def own_queue_pids(self):
+        result = {}
+        for item in pathlib.Path('/proc').iterdir():
+            if not item.name.isdigit():
+                continue
+            try:
+                args = (item / 'cmdline').read_bytes().split(b'\0')
+                if b'queue:work' not in args:
+                    continue
+                artisans = [pathlib.Path(x.decode()) for x in args if x.endswith(b'/artisan')]
+                if any(x.resolve() == self.root / 'artisan' for x in artisans):
+                    result[int(item.name)] = args
+            except (FileNotFoundError, ProcessLookupError, PermissionError, UnicodeError):
+                continue
+        return result
+
+    def workers(self):
+        rows = self.statuses()
+        pids = self.own_queue_pids()
+        if any(x['state'] != 'RUNNING' or x['pid'] not in pids for x in rows.values()) or set(pids) != {x['pid'] for x in rows.values()}:
+            raise Refuse('worker_scope_or_state_drift')
+        specs = {}
+        for row in rows.values():
+            pid = row['pid']
+            if pathlib.Path(os.readlink('/proc/' + str(pid) + '/exe')).resolve() != pathlib.Path(self.p['php_cli']).resolve():
+                raise Refuse('wrong_worker_php')
+            argv = [x.decode() for x in pids[pid] if x]
+            i = argv.index('queue:work')
+            connection = argv[i + 1] if len(argv) > i + 1 and not argv[i + 1].startswith('-') else self.cfg['queue']['default']
+            conf = self.cfg['queue']['connections'].get(connection)
+            if not isinstance(conf, dict) or conf.get('driver') != 'database':
+                raise Refuse('only_existing_database_queue_supported')
+            queues = conf['queue']
+            for j, value in enumerate(argv):
+                if value.startswith('--queue='):
+                    queues = value.partition('=')[2]
+                elif value == '--queue':
+                    queues = argv[j + 1]
+            names = queues.split(',')
+            if any(not re.fullmatch(r'[A-Za-z0-9_.:-]{1,128}', x) for x in names):
+                raise Refuse('invalid_owned_queue')
+            specs.setdefault(connection, set()).update(names)
+        return rows, {key: sorted(value) for key, value in specs.items()}
+
+    @staticmethod
+    def validate_opcache_values(info, overrides):
+        parsed={}
+        for key in ['opcache.enable','opcache.validate_timestamps','opcache.revalidate_freq']:
+            rows=re.findall(r'^'+re.escape(key)+r'\s*=>\s*(\S+)\s*=>\s*(\S+)\s*$',info,re.M)
+            if len(rows)!=1 or rows[0][0]!=rows[0][1]:
+                raise Refuse('unverifiable_fpm_opcache_configuration')
+            parsed[key]=rows[0][0]
+        parsed.update(overrides)
+        if parsed['opcache.validate_timestamps'].lower() not in ['on','1','yes','true']:
+            raise Refuse('fpm_opcache_timestamp_validation_required')
+        if not parsed['opcache.revalidate_freq'].isdigit() or not 0<=int(parsed['opcache.revalidate_freq'])<=5:
+            raise Refuse('bounded_fpm_opcache_revalidation_required')
+        if parsed['opcache.enable'].lower() not in ['on','off','0','1','yes','no','true','false']:
+            raise Refuse('unverifiable_fpm_opcache_enable')
+        return int(parsed['opcache.revalidate_freq'])+2
+
+    def fpm_opcache_guard(self):
+        folder=pathlib.Path('/etc/php')/self.p['php_minor']/'fpm'
+        overrides={};selected=0
+        for file in (folder/'pool.d').glob('*.conf'):
+            section=None
+            for line in file.read_text().splitlines():
+                stripped=line.strip()
+                if not stripped or stripped.startswith(';'):continue
+                if stripped.startswith('[') and stripped.endswith(']'):
+                    section=stripped[1:-1];continue
+                if section!=self.p['fpm_pool']:continue
+                if re.match(r'include\s*=',stripped):
+                    raise Refuse('nested_selected_pool_include_unsupported')
+                if re.match(r'listen\s*=',stripped):
+                    selected+=1
+                    if pathlib.Path(stripped.split('=',1)[1].strip()).resolve()!=path_value(self.p['fpm_socket']).resolve():
+                        raise Refuse('selected_opcache_pool_socket_mismatch')
+                match=re.match(r'php_(?:admin_)?value\[(opcache\.[A-Za-z_]+)\]\s*=\s*(.*?)\s*$',stripped)
+                if match:
+                    if match[1] not in ['opcache.enable','opcache.validate_timestamps','opcache.revalidate_freq']:
+                        continue
+                    if match[1]in overrides:raise Refuse('ambiguous_opcache_pool_override')
+                    overrides[match[1]]=match[2]
+        if selected!=1:
+            raise Refuse('exact_selected_opcache_pool_required')
+        nginx_expanded=self.run(['nginx','-T'])
+        if re.search(rb'fastcgi_param\s+PHP_(?:ADMIN_)?VALUE\b',nginx_expanded):
+            raise Refuse('request_php_ini_overrides_unsupported')
+        if list(self.root.rglob('.user.ini')):
+            raise Refuse('per_directory_php_ini_unsupported')
+        info=self.run(['/usr/sbin/php-fpm'+self.p['php_minor'],'-i']).decode()
+        delay=self.validate_opcache_values(info,overrides)
+        files=[folder/'php.ini',*(folder/'conf.d').glob('*'),*(folder/'pool.d').glob('*.conf')]
+        self.fpm_config_hashes={str(file):digest(file) for file in files if file.is_file()}
+        self.opcache_delay=delay
+        self.report['fpm_opcache_timestamp_validation']=True
+        self.report['opcache_wait_seconds']=delay
+
+    def validate_queue_connections(self):
+        for connection in self.queue_specs:
+            queue = self.cfg['queue']['connections'][connection]
+            if queue.get('driver') != 'database' or not re.fullmatch(r'[A-Za-z0-9_]+',queue.get('table','')):
+                raise Refuse('unsupported_existing_queue_connection')
+            db = self.cfg['database']['connections'][queue.get('connection') or self.cfg['database']['default']]
+            if db.get('driver') != 'mysql' or db.get('url') or db.get('unix_socket') or db.get('prefix') or db.get('options') or db.get('read') or db.get('write'):
+                raise Refuse('unsupported_database_dsn_or_options')
+            if not isinstance(db.get('host'),str) or not isinstance(db.get('database'),str) or not isinstance(db.get('username'),str) or not str(db.get('port',3306)).isdigit():
+                raise Refuse('unsupported_database_address')
+            if db.get('charset','utf8mb4') not in ['utf8','utf8mb4']:
+                raise Refuse('unsupported_database_charset')
+
+    def fpm_status(self):
+        path = self.p.get('fpm_status_path')
+        if not path or not self.p.get('fpm_pool') or not self.p.get('fpm_status_socket') or not shutil.which('cgi-fcgi'):
+            raise Refuse('existing_fpm_full_status_required_unsupported')
+        socket=path_value(self.p['fpm_status_socket'])
+        if socket.parent.is_symlink() or socket.parent.stat().st_uid!=0 or stat.S_IMODE(socket.parent.stat().st_mode)!=0o700 or not stat.S_ISSOCK(socket.stat().st_mode):
+            raise Refuse('root_only_existing_status_socket_required')
+        env = {'PATH':'/usr/bin:/bin','SCRIPT_NAME':path,'SCRIPT_FILENAME':path,
+               'REQUEST_METHOD':'GET','QUERY_STRING':'full&json','REQUEST_URI':path+'?full&json',
+               'SERVER_PROTOCOL':'HTTP/1.1','GATEWAY_INTERFACE':'CGI/1.1','CONTENT_LENGTH':'0'}
+        raw = self.run(['cgi-fcgi','-bind','-connect',str(socket)],env=env)
+        body = re.split(rb'\r?\n\r?\n',raw,maxsplit=1)
+        if len(body)!=2:
+            raise Refuse('invalid_existing_fpm_status_response')
+        status = json.loads(body[1])
+        if status.get('pool')!=self.p['fpm_pool'] or not isinstance(status.get('processes'),list) or len(status['processes'])!=status.get('total processes'):
+            raise Refuse('incomplete_or_wrong_fpm_full_status')
+        return status
+
+    def active_fpm_requests(self,status):
+        active=[]
+        if type(status.get('listen queue')) is not int or status['listen queue']<0:
+            raise Refuse('fpm_listen_queue_coverage_required')
+        if status['listen queue']:
+            active.append('pending_fpm_requests')
+        for row in status['processes']:
+            if row.get('state')=='Idle':
+                continue
+            uri = row.get('request uri','').split('?',1)[0]
+            if uri == self.p['fpm_status_path']:
+                continue
+            script = row.get('script')
+            if not isinstance(script,str) or not script.startswith('/'):
+                raise Refuse('unidentifiable_active_fpm_script')
+            script_path = pathlib.Path(script)
+            if any(script_path.is_relative_to(root) for root in [self.entry,self.root]):
+                active.append(row.get('pid'))
+        return active
+
+    def drain_fpm(self):
+        until=time.monotonic()+self.p.get('drain_timeout',120)
+        while self.active_fpm_requests(self.fpm_status()):
+            if time.monotonic()>until:
+                raise Refuse('owned_fpm_request_drain_timeout_no_force')
+            time.sleep(.25)
+
+    def counts(self):
+        # Credentials never leave this short-lived PHP process.
+        code = r'''$c=require $argv[1];$spec=json_decode($argv[2],true,512,JSON_THROW_ON_ERROR);$out=['jobs'=>0,'reserved'=>0];foreach($spec as $name=>$queues){$q=$c['queue']['connections'][$name];if($q['driver']!=='database'||!preg_match('/^[A-Za-z0-9_]+$/D',$q['table']))exit(21);$d=$c['database']['connections'][$q['connection']??$c['database']['default']];if(!empty($d['prefix']))exit(22);$p=new PDO('mysql:host='.$d['host'].';port='.($d['port']??3306).';dbname='.$d['database'].';charset='.($d['charset']??'utf8mb4'),$d['username'],$d['password'],[PDO::ATTR_ERRMODE=>PDO::ERRMODE_EXCEPTION]);$s=$p->prepare('SELECT COUNT(*) n,COALESCE(SUM(reserved_at IS NOT NULL),0) r FROM `'.$q['table'].'` WHERE queue IN ('.implode(',',array_fill(0,count($queues),'?')).')');$s->execute($queues);$x=$s->fetch(PDO::FETCH_ASSOC);$out['jobs']+=(int)$x['n'];$out['reserved']+=(int)$x['r'];}echo json_encode($out);'''
+        return json.loads(self.php(code, [self.queue_cache, json.dumps(self.queue_specs)]))
+
+    def producers(self):
+        result = []
+        for proc in pathlib.Path('/proc').iterdir():
+            if not proc.name.isdigit():
+                continue
+            try:
+                args = (proc / 'cmdline').read_bytes().split(b'\0')
+                if b'queue:work' in args:
+                    continue
+                own = any(x.endswith(b'/artisan') and pathlib.Path(x.decode()).resolve() == self.root / 'artisan' for x in args)
+                own = own or b'artisan' in args and pathlib.Path(os.readlink(proc / 'cwd')).resolve() == self.root
+                if own:
+                    result.append(int(proc.name))
+            except (FileNotFoundError, PermissionError, ProcessLookupError, UnicodeError):
+                continue
+        return result
+
+    def drain_producers(self):
+        until = time.monotonic() + self.p.get('drain_timeout', 120)
+        while self.producers():
+            if time.monotonic() > until:
+                raise Refuse('own_producer_drain_timeout_no_force')
+            time.sleep(.25)
+
+    def stopped(self):
+        rows = self.statuses()
+        if any(x['state'] != 'STOPPED' or x['pid'] != 0 for x in rows.values()) or self.own_queue_pids() or self.counts()['reserved']:
+            raise Refuse('actual_stopped_and_idle_required')
+        for name in rows:
+            value = self.run(['supervisorctl', 'pid', name], allowed=(0, 7))
+            if value.strip() != b'0':
+                raise Refuse('stopped_pid_not_zero')
+
+    def quiesce(self):
+        rows = self.statuses()
+        running = {name: x for name, x in rows.items() if x['state'] == 'RUNNING'}
+        pids = self.own_queue_pids()
+        if any(x['pid'] not in pids for x in running.values()):
+            raise Refuse('unexpected_running_worker')
+        self.pause_requested = True
+        for name in running:
+            self.run(['supervisorctl', 'signal', 'USR2', name])
+        until = time.monotonic() + self.p.get('drain_timeout', 120)
+        while self.counts()['reserved']:
+            now = self.statuses()
+            if any(now[name]['pid'] != value['pid'] for name, value in running.items()):
+                raise Refuse('worker_pid_changed_while_draining')
+            if time.monotonic() > until:
+                raise Refuse('busy_queue_no_force_no_replay')
+            time.sleep(.5)
+        for name, row in self.statuses().items():
+            if name in running and row['pid'] != running[name]['pid']:
+                raise Refuse('worker_pid_drift_before_stop')
+            # Explicitly stop BACKOFF/FATAL/EXITED as well; PID0 alone is not STOPPED.
+            self.run(['supervisorctl', 'stop', name], allowed=(0, 1, 2))
+        self.stopped()
+        self.workers_stopped = True
+
+    def start(self):
+        for name in self.statuses():
+            self.run(['supervisorctl', 'start', name], allowed=(0, 1, 2))
+        until = time.monotonic() + self.p.get('start_timeout', 35)
+        while time.monotonic() < until:
+            rows = self.statuses()
+            if all(x['state'] == 'RUNNING' for x in rows.values()):
+                self.workers()
+                self.workers_stopped = False
+                self.pause_requested = False
+                return
+            time.sleep(.5)
+        raise Refuse('selected_worker_start_failed')
+
+    def http(self, host, port):
+        url = ('https' if port == '443' else 'http') + '://' + host + '/'
+        return int(self.run(['curl', '--noproxy', '*', '--resolve', host + ':' + port + ':127.0.0.1', '-ks', '-o', '/dev/null', '-w', '%{http_code}', '--max-time', '5', url]))
+
+    def public_codes(self):
+        return {host: {port: self.http(host, port) for port in ['80', '443']} for host in self.p['server_names']}
+
+    def await_public_baseline(self, receipt_key):
+        until=time.monotonic()+10
+        stable=0
+        observations=[]
+        self.report[receipt_key]=observations
+        while time.monotonic()<until:
+            codes=self.public_codes()
+            observations.append(codes)
+            if any(value>=500 and value!=503 for row in codes.values() for value in row.values()):
+                raise Refuse('new_release_public_baseline_failed')
+            stable=stable+1 if codes==self.p['public_baselines'] else 0
+            if stable>=2:return
+            time.sleep(.25)
+        raise Refuse('new_release_public_baseline_failed')
+
+    def restore_nginx_public(self, receipt_key):
+        previous=self.nginx_worker_pids()
+        self.nginx(self.nginx_before)
+        until=time.monotonic()+10
+        while any(pathlib.Path('/proc',str(pid)).exists() for pid in previous):
+            if time.monotonic()>until:
+                raise Refuse('restored_nginx_generation_not_drained')
+            time.sleep(.25)
+        self.report[receipt_key]={'previous_worker_pids':sorted(previous),'current_worker_pids':sorted(self.nginx_worker_pids())}
+
+    def nginx(self, content):
+        self.atomic(self.nginx_path, content, self.nginx_stat)
+        self.run(['nginx', '-t'])
+        self.run(['systemctl', 'reload', 'nginx'])
+
+    def nginx_worker_pids(self):
+        rows=set()
+        for p in pathlib.Path('/proc').iterdir():
+            if not p.name.isdigit():continue
+            try:
+                command=(p/'cmdline').read_bytes().replace(b'\0',b' ').strip()
+                if command.startswith(b'nginx: worker process'):rows.add(int(p.name))
+            except OSError:pass
+        return rows
+
+    def gate(self):
+        previous_workers=self.nginx_worker_pids()
+        self.gated = True
+        self.nginx(self.nginx_gate)
+        for _ in range(25):
+            if all(value == 503 for row in self.public_codes().values() for value in row.values()):
+                deadline=time.monotonic()+self.p.get('drain_timeout',120)
+                while any(pathlib.Path('/proc',str(pid)).exists() for pid in previous_workers):
+                    if time.monotonic()>deadline:
+                        raise Refuse('previous_nginx_requests_not_drained_no_force')
+                    time.sleep(.25)
+                return
+            time.sleep(.2)
+        raise Refuse('owned_http_gate_not_confirmed')
+
+    def cron(self, content):
+        self.run(['crontab', '-u', self.p.get('cron_user', 'www-data'), '-'], input=content)
+
+    def atomic(self, path, data, metadata):
+        path = pathlib.Path(path)
+        tmp = path.with_name('.' + path.name + '.repeat-' + secrets.token_hex(8))
+        fd = os.open(tmp, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+        try:
+            os.fchown(fd, metadata.st_uid, metadata.st_gid)
+            os.fchmod(fd, stat.S_IMODE(metadata.st_mode))
+            with os.fdopen(fd, 'wb') as stream:
+                stream.write(data)
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.replace(tmp, path)
+        finally:
+            if tmp.exists():
+                tmp.unlink()
+
+    def state_path(self):
+        return pathlib.Path('/var/lib/ansible-deploy/existing')/self.p['project']/'current.json'
+
+    def trusted_state_directory(self, create=False):
+        path = self.state_path().parent
+        for part in reversed([path, *path.parents]):
+            if not part.exists():
+                if create:
+                    part.mkdir(mode=0o700)
+                else:
+                    continue
+            if part.is_symlink() or not part.is_dir() or part.stat().st_uid != 0 or part.stat().st_mode & 0o022:
+                raise Refuse('untrusted_recorded_state_directory')
+        if path.exists() and stat.S_IMODE(path.stat().st_mode) != 0o700:
+            raise Refuse('private_recorded_state_directory_required')
+
+    def recorded_manifest(self):
+        self.trusted_state_directory()
+        path=self.state_path()
+        if not path.exists():
+            return
+        if path.is_symlink() or path.stat().st_uid!=0 or stat.S_IMODE(path.stat().st_mode)!=0o600 or path.parent.stat().st_uid!=0 or stat.S_IMODE(path.parent.stat().st_mode)!=0o700:
+            raise Refuse('untrusted_recorded_deployment_state')
+        state=json.loads(path.read_text())
+        if state.get('application_root')!=str(self.entry) or state.get('runtime_root')!=str(self.root) or state.get('server_identity_sha256')!=self.p['server_identity_sha256']:
+            raise Refuse('recorded_deployment_scope_mismatch')
+        self.p['live_manifest']=state['source_manifest']
+        validate_profile(self.p)
+
+    def persist_state(self):
+        path=self.state_path()
+        self.trusted_state_directory(create=True)
+        self.state_before = path.read_bytes() if path.exists() else None
+        data=json.dumps({'schema_version':1,'application_root':str(self.entry),'runtime_root':str(self.root),'server_identity_sha256':self.p['server_identity_sha256'],'source_manifest':self.p['candidate_manifest'],'receipt':self.report},indent=2).encode()
+        tmp=path.with_name('.current-'+secrets.token_hex(8))
+        fd=os.open(tmp,os.O_CREAT|os.O_EXCL|os.O_WRONLY,0o600)
+        with os.fdopen(fd,'wb') as stream:stream.write(data);stream.flush();os.fsync(stream.fileno())
+        self.state_write_started = True
+        os.replace(tmp,path)
+
+    def preflight(self):
+        if digest('/etc/machine-id')!=self.p['server_identity_sha256']:
+            raise Refuse('wrong_server_identity')
+        self.recorded_manifest()
+        live_sha=self.p['live_manifest']['candidate_commit'];candidate_sha=self.p['candidate_manifest']['candidate_commit']
+        if live_sha!=candidate_sha and live_sha not in self.p['candidate_manifest'].get('ancestor_commits',[]):
+            raise Refuse('candidate_must_include_current_live_commit')
+        if not self.root.is_dir() or not (self.root / '.env').is_file() or not (self.root / 'storage').is_dir():
+            raise Refuse('existing_app_and_anchors_required')
+        if digest(self.archive) != self.p['source_archive_sha256']:
+            raise Refuse('source_archive_digest_mismatch')
+        self.manifest(self.root, self.p['live_manifest'])
+        version = self.php('echo PHP_MAJOR_VERSION.".".PHP_MINOR_VERSION;').decode()
+        if version != self.p['php_minor'] or not stat.S_ISSOCK(path_value(self.p['fpm_socket']).stat().st_mode):
+            raise Refuse('selected_php_or_fpm_not_ready')
+        self.queue_cache = self.root / 'bootstrap/cache/config.php'
+        self.uid, self.gid = self.queue_cache.stat().st_uid, self.queue_cache.stat().st_gid
+        if self.uid == 0:
+            raise Refuse('nonroot_application_configuration_owner_required')
+        self.cfg = self.config(self.root)
+        if stat.S_IMODE(self.queue_cache.stat().st_mode) != 0o640 or stat.S_IMODE((self.root / '.env').stat().st_mode) not in [0o600, 0o640]:
+            raise Refuse('protected_env_cache_modes_required')
+        self.uid, self.gid = self.queue_cache.stat().st_uid, self.queue_cache.stat().st_gid
+        self.worker_rows, self.queue_specs = self.workers()
+        self.validate_queue_connections()
+        self.counts()
+        self.active_fpm_requests(self.fpm_status())
+        self.nginx_entry = path_value(self.p['nginx_config'])
+        self.nginx_entry_lstat = self.nginx_entry.lstat()
+        self.nginx_entry_target = os.readlink(self.nginx_entry) if self.nginx_entry.is_symlink() else None
+        self.nginx_path = self.nginx_entry.resolve(strict=True)
+        if not str(self.nginx_path).startswith('/etc/nginx/'):
+            raise Refuse('nginx_target_outside_scope')
+        self.nginx_stat = self.nginx_path.stat()
+        self.nginx_before = self.nginx_path.read_bytes()
+        self.fpm_opcache_guard()
+        names = re.findall(rb'\bserver_name\s+([^;]+);', self.nginx_before)
+        if not names or {part.decode() for row in names for part in row.split()} != set(self.p['server_names']):
+            raise Refuse('nginx_contains_foreign_or_wildcard_names')
+        blocks = list(re.finditer(rb'\bserver\s*\{', self.nginx_before))
+        if len(blocks) != len(names):
+            raise Refuse('nginx_server_structure_not_supported')
+        self.nginx_gate = self.nginx_before
+        for block in reversed(blocks):
+            self.nginx_gate = self.nginx_gate[:block.end()] + b'\n return 503; # reviewed repeat deployment\n' + self.nginx_gate[block.end():]
+        bindings = re.findall(rb'fastcgi_pass\s+unix:([^;]+);',self.nginx_before)
+        if not bindings or any(pathlib.Path(s.decode()).resolve()!=path_value(self.p['fpm_socket']).resolve() for s in bindings):
+            raise Refuse('owned_vhost_fpm_binding_mismatch')
+        self.supervisor_hashes = {name: digest(name) for name in self.p['supervisor_config_hashes']}
+        if self.supervisor_hashes != self.p['supervisor_config_hashes']:
+            raise Refuse('supervisor_configuration_drift')
+        self.cron_before = self.run(['crontab', '-u', self.p.get('cron_user', 'www-data'), '-l'])
+        lines = self.cron_before.splitlines(keepends=True)
+        match = []
+        for i, line in enumerate(lines):
+            if line.lstrip().startswith(b'#'):
+                continue
+            if any(re.search(re.escape(str(root).encode()) + rb'(?=/|\s|;|$)', line) for root in [self.entry, self.root]):
+                match.append(i)
+        if len(match) != 1 or b'artisan schedule:run' not in lines[match[0]] or self.p['php_cli'].encode() not in lines[match[0]]:
+            raise Refuse('exact_single_existing_php_scheduler_required')
+        paused = lines.copy()
+        paused[match[0]] = b'# REVIEWED_REPEAT_DEPLOY_PAUSE ' + paused[match[0]]
+        self.cron_paused_content = b''.join(paused)
+        if self.public_codes() != self.p['public_baselines']:
+            raise Refuse('public_baseline_drift')
+        self.env_anchor = (self.root / '.env').resolve()
+        self.storage_anchor = (self.root / 'storage').resolve()
+        self.anchor_inodes = {'env': self.env_anchor.stat().st_ino, 'storage': self.storage_anchor.stat().st_ino}
+        self.env_hash = digest(self.env_anchor)
+        self.old_cache = self.queue_cache.read_bytes()
+        self.standard_public_storage = (self.root/'public/storage').is_symlink() and (self.root/'public/storage').resolve().is_relative_to(self.storage_anchor)
+        self.check_untracked_runtime()
+        self.report.update(status='PREFLIGHT_PASS',own_processes=len(self.worker_rows),worker_groups=len(self.p['worker_groups']),actual_runtime_root=str(self.root))
+        return self.report
+
+    def check_untracked_runtime(self):
+        known = set(self.p['live_manifest']['files'])
+        preserved = self.p.get('preserve_copy_paths', []) + self.p.get('preserve_link_paths', [])
+        automatic = ['bootstrap/cache', 'packages/leolnid/common-deploy']
+        if self.standard_public_storage:
+            automatic.append('public/storage')
+        prefixes = preserved + automatic
+        for folder in ['app','bootstrap','config','database','routes','resources','lang','public','packages']:
+            start = self.root/folder
+            if not start.is_dir():
+                continue
+            for current, dirs, files in os.walk(start, followlinks=False):
+                for name in list(dirs):
+                    rel = str((pathlib.Path(current)/name).relative_to(self.root))
+                    if name == '.git' or any(rel == p or rel.startswith(p+'/') for p in prefixes):
+                        dirs.remove(name)
+                    elif (pathlib.Path(current)/name).is_symlink() and rel not in known:
+                        raise Refuse('unclassified_runtime_symlink')
+                for name in files:
+                    rel = str((pathlib.Path(current)/name).relative_to(self.root))
+                    if rel not in known and not any(rel == p or rel.startswith(p+'/') for p in prefixes):
+                        raise Refuse('unclassified_runtime_file_requires_profile')
+
+    def tree_fingerprint(self,path):
+        path=pathlib.Path(path)
+        out={}
+        def visit(p,rel):
+            if p.is_symlink():out[rel]=['symlink',os.readlink(p)];return
+            if p.is_dir():
+                out[rel]=['directory']
+                for c in sorted(p.iterdir()):visit(c,rel+'/'+c.name)
+            elif p.is_file():out[rel]=['file',digest(p)]
+            else:raise Refuse('unsupported_preserved_artifact_type')
+        visit(path,'.')
+        return out
+
+    def prepare(self):
+        self.phase = 'stage_prepare'
+        stamp = datetime.datetime.now(datetime.timezone.utc).strftime('%Y%m%dT%H%M%SZ')
+        self.stage = self.root.parent / ('.' + self.p['project'] + '-candidate-' + stamp + '-' + secrets.token_hex(4))
+        self.old_root = self.root.parent / ('.' + self.p['project'] + '-previous-' + stamp + '-' + secrets.token_hex(4))
+        self.control = self.root.parent / ('.' + self.p['project'] + '-deployment-' + stamp + '-' + secrets.token_hex(4))
+        self.control.mkdir(mode=0o700)
+        self.checkpoint()
+        if shutil.disk_usage(self.root.parent).free < self.p.get('minimum_free_bytes', 1024 ** 3):
+            raise Refuse('insufficient_release_space')
+        self.stage.mkdir(mode=0o755)
+        with tarfile.open(self.archive) as archive:
+            members = archive.getmembers()
+            copy_roots=[self.root/'vendor',*[self.root/x for x in self.p.get('preserve_copy_paths',[])]]
+            copy_size=0
+            for copy_root in copy_roots:
+                for current,dirs,files in os.walk(copy_root,followlinks=False):
+                    copy_size += sum((pathlib.Path(current)/name).lstat().st_size for name in files)
+            required=sum(max(0,x.size) for x in members)+copy_size+self.p.get('minimum_free_bytes',1024**3)
+            if shutil.disk_usage(self.root.parent).free < required:
+                raise Refuse('insufficient_staged_release_and_reserve_space')
+            for member in members:
+                rel = source_path(member.name.rstrip('/'))
+                parts = pathlib.PurePosixPath(rel).parts
+                if '.git' in parts or any(x in ['.env','auth.json','ansible.key'] for x in parts) or parts[0] in ['storage','vendor'] or rel.startswith('bootstrap/cache/') and not rel.endswith('.gitignore'):
+                    raise Refuse('protected_or_secret_artifact_member')
+                if member.isdev() or member.isfifo() or member.islnk():
+                    raise Refuse('unsupported_artifact_member')
+                if member.issym():
+                    target = self.stage / pathlib.PurePosixPath(rel).parent / member.linkname
+                    if not target.resolve().is_relative_to(self.stage):
+                        raise Refuse('artifact_symlink_escape')
+            archive.extractall(self.stage, members=members, filter='data')
+        if list(self.stage.rglob('.user.ini')):
+            raise Refuse('candidate_per_directory_php_ini_unsupported')
+        # Code-only deployments deliberately do not run Composer or frontend tools.
+        for name in ['composer.json', 'composer.lock']:
+            if json.loads((self.stage / name).read_text()) != json.loads((self.root / name).read_text()):
+                raise Refuse('dependency_change_requires_separate_reviewed_vendor_release')
+        if 'setClassMapAuthoritative(true)' in (self.root / 'vendor/composer/autoload_real.php').read_text():
+            raise Refuse('authoritative_classmap_requires_separate_reviewed_vendor_release')
+        shutil.copytree(self.root / 'vendor', self.stage / 'vendor', symlinks=True)
+        self.links = {'.env': self.env_anchor, 'storage': self.storage_anchor}
+        if self.standard_public_storage:
+            self.links['public/storage'] = (self.root/'public/storage').resolve()
+        self.preserved_copy_fingerprints={}
+        for rel in self.p.get('preserve_copy_paths', []):
+            src, dst = self.root / rel, self.stage / rel
+            if dst.exists() or dst.is_symlink() or not src.exists():
+                raise Refuse('ambiguous_preserved_artifact')
+            if src.is_symlink():
+                raise Refuse('preserved_symlink_must_be_a_runtime_link')
+            self.preserved_copy_fingerprints[rel]=self.tree_fingerprint(src)
+            if src.is_dir():
+                shutil.copytree(src, dst, symlinks=True)
+            else:
+                dst.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(src, dst)
+        for rel in self.p.get('preserve_link_paths', []):
+            self.links[rel] = (self.root / rel).resolve(strict=True)
+        for rel, anchor in self.links.items():
+            target = self.stage / rel
+            if target.exists() or target.is_symlink():
+                raise Refuse('artifact_overlaps_existing_runtime_anchor')
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.symlink_to(anchor, target_is_directory=anchor.is_dir())
+        for root, dirs, files in os.walk(self.stage, followlinks=False):
+            for name in dirs + files:
+                path = pathlib.Path(root) / name
+                if path.is_symlink():
+                    continue
+                mode = 0o755 if path.is_dir() or path.stat().st_mode & 0o111 else 0o644
+                os.chown(path, self.uid, self.gid)
+                path.chmod(mode)
+                if path.is_file():
+                    old=self.root/path.relative_to(self.stage)
+                    fresh=int(time.time())
+                    if old.is_file() and int(old.stat().st_mtime)==fresh:fresh+=1
+                    os.utime(path,(fresh,fresh))
+        os.chown(self.stage, self.uid, self.gid)
+        cache_dir = self.stage / 'bootstrap/cache'
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        os.chown(cache_dir, self.uid, self.gid)
+        cache_dir.chmod(0o755)
+        cache_file = cache_dir/'config.php'
+        if cache_file.exists():
+            raise Refuse('artifact_must_not_supply_default_cache')
+        cache_file.write_bytes(self.old_cache)
+        os.chown(cache_file,self.uid,self.gid)
+        cache_file.chmod(0o640)
+        self.manifest(self.stage, self.p['candidate_manifest'])
+        self.php("require $argv[1].'/vendor/composer/platform_check.php';", [self.stage])
+        self.report.update(stage=str(self.stage),retained_previous_release=str(self.old_root))
+        self.checkpoint()
+
+    def config_equal(self, old, new, path=''):
+        key=path.lstrip('.')
+        delta=self.p.get('config_change_hashes',{}).get(key)
+        if delta is not None:
+            canonical=lambda value:sha(json.dumps(value,sort_keys=True,separators=(',',':'),ensure_ascii=True).encode())
+            return canonical(old)==delta['old'] and canonical(new)==delta['new']
+        if type(old) is not type(new):
+            return False
+        if isinstance(old, dict):
+            return old.keys() == new.keys() and all(self.config_equal(old[k], new[k], path + '.' + str(k)) for k in old)
+        if isinstance(old, list):
+            return len(old) == len(new) and all(self.config_equal(a, b, path + '[]') for a, b in zip(old, new))
+        if old == new:
+            return True
+        # Only path-valued fields that resolve to the very same retained data are
+        # mechanically equivalent. Never rewrite configuration values at runtime.
+        if key in self.p.get('same_inode_config_paths', []) and isinstance(old, str) and isinstance(new, str):
+            a, b = pathlib.Path(old), pathlib.Path(new)
+            return a.is_absolute() and b.is_absolute() and a.exists() and b.exists() and a.stat().st_dev == b.stat().st_dev and a.stat().st_ino == b.stat().st_ino
+        return False
+
+    def build_config(self):
+        self.phase = 'protected_final_config'
+        cache = self.root / 'bootstrap/cache/config.php'
+        temp = cache.with_name('.repeat-config-' + secrets.token_hex(8) + '.php')
+        self.temp_cache = temp
+        private_paths={
+            'APP_CONFIG_CACHE':temp,
+            'APP_SERVICES_CACHE':cache.with_name('.repeat-services-'+secrets.token_hex(8)+'.php'),
+            'APP_PACKAGES_CACHE':cache.with_name('.repeat-packages-'+secrets.token_hex(8)+'.php'),
+            'APP_EVENTS_CACHE':cache.with_name('.repeat-events-'+secrets.token_hex(8)+'.php'),
+            'APP_ROUTES_CACHE':cache.with_name('.repeat-routes-'+secrets.token_hex(8)+'.php'),
+        }
+        prefix = ['unshare','--net','sudo','-u','#'+str(self.uid),'env',*[key+'='+str(value) for key,value in private_paths.items()],self.p['php_cli']]
+        probe = "require $argv[1].'/vendor/autoload.php';$a=require $argv[1].'/bootstrap/app.php';echo $a->getCachedConfigPath();"
+        paths_probe="require $argv[1].'/vendor/autoload.php';$a=require $argv[1].'/bootstrap/app.php';echo json_encode([$a->getCachedConfigPath(),$a->getCachedServicesPath(),$a->getCachedPackagesPath(),$a->getCachedEventsPath(),$a->getCachedRoutesPath()]);"
+        if json.loads(self.run(prefix + ['-r',paths_probe,str(self.root)])) != [str(value) for value in private_paths.values()]:
+            raise Refuse('actual_temp_config_path_mismatch')
+        # No active cache is cleared: Laravel sees only this fresh private path.
+        self.run(prefix + ['artisan','config:cache','--quiet'], cwd=self.root, umask=0o077)
+        if not cache.is_file() or cache.read_bytes() != self.old_cache:
+            raise Refuse('default_cache_changed_before_validated_promotion')
+        temp.chmod(0o600)
+        os.chown(temp,self.uid,self.gid)
+        fresh = json.loads(self.php('$c=require $argv[1];echo json_encode($c,JSON_THROW_ON_ERROR);',[temp]))
+        if not self.config_equal(self.cfg, fresh):
+            raise Refuse('unreviewed_effective_configuration_change')
+        temp.chmod(0o640)
+        os.replace(temp,cache)
+        self.temp_cache = None
+
+    def cutover(self):
+        self.phase = 'fresh_live_guards'
+        self.manifest(self.root,self.p['live_manifest'])
+        if self.env_hash != digest(self.env_anchor) or self.old_cache != (self.root/'bootstrap/cache/config.php').read_bytes() or self.nginx_before != self.nginx_path.read_bytes() or self.cron_before != self.run(['crontab','-u',self.p.get('cron_user','www-data'),'-l']) or self.supervisor_hashes != {p:digest(p) for p in self.supervisor_hashes}:
+            raise Refuse('protected_runtime_drift')
+        if getattr(self,'fpm_config_hashes',{}) != {p:digest(p) for p in getattr(self,'fpm_config_hashes',{})}:
+            raise Refuse('fpm_configuration_changed_during_stage')
+        if any(self.tree_fingerprint(self.root/rel)!=h for rel,h in self.preserved_copy_fingerprints.items()):
+            raise Refuse('preserved_artifacts_changed_during_stage_build')
+        rows,_ = self.workers()
+        if rows != self.worker_rows:
+            raise Refuse('worker_pid_changed_before_cutover')
+        self.phase = 'own_cron_and_producer_drain'
+        self.cron(self.cron_paused_content)
+        self.cron_paused = True
+        self.drain_producers()
+        self.phase = 'owned_http_gate_and_worker_idle'
+        self.gate()
+        self.drain_fpm()
+        self.quiesce()
+        self.stopped()
+        self.phase = 'atomic_release_cutover'
+        self.root.rename(self.old_root)
+        self.old_moved = True
+        self.queue_cache = self.old_root/'bootstrap/cache/config.php'
+        for rel, original in self.links.items():
+            anchor = self.old_root/original.relative_to(self.root) if original.is_relative_to(self.root) else original
+            link = self.stage/rel
+            link.unlink()
+            link.symlink_to(anchor,target_is_directory=anchor.is_dir())
+        self.stage.rename(self.root)
+        self.swapped = True
+        self.build_config()
+        if digest(self.root/'.env') != self.env_hash or (self.root/'.env').stat().st_ino != self.anchor_inodes['env'] or (self.root/'storage').stat().st_ino != self.anchor_inodes['storage']:
+            raise Refuse('runtime_anchor_changed')
+        self.manifest(self.root,self.p['candidate_manifest'])
+        self.phase = 'start_owned_topology'
+        self.start()
+        time.sleep(getattr(self,'opcache_delay',0))
+        self.restore_nginx_public('cutover_nginx_generations')
+        self.gated = False
+        self.await_public_baseline('public_cutover_observations')
+        self.cron(self.cron_before)
+        self.cron_paused = False
+        if self.supervisor_hashes != {p:digest(p) for p in self.supervisor_hashes}:
+            raise Refuse('supervisor_was_changed')
+        self.manifest(self.root,self.p['candidate_manifest'])
+        if hasattr(self,'nginx_entry') and self.nginx_entry_target is not None and (not self.nginx_entry.is_symlink() or self.nginx_entry.lstat().st_ino!=self.nginx_entry_lstat.st_ino or os.readlink(self.nginx_entry)!=self.nginx_entry_target):
+            raise Refuse('nginx_entrypoint_was_changed')
+        self.phase = 'verified'
+        self.report.update(status='PASS',completed_utc=datetime.datetime.now(datetime.timezone.utc).isoformat(),own_processes=len(self.statuses()),env_storage_same_inodes=True,supervisor_and_cron_topology_unchanged=True,source_permissions_normalized_in_stage_only=True,backup_reference=self.p['backup_reference'])
+        self.checkpoint()
+        self.persist_state()
+        return self.report
+
+    def rollback(self):
+        self.phase = 'rollback'
+        if self.swapped:
+            if not self.cron_paused:
+                self.cron(self.cron_paused_content)
+                self.cron_paused = True
+            if not self.gated:
+                self.gate()
+            self.drain_fpm()
+            self.drain_producers()
+            # Always reconcile actual states, even after a partially failed start.
+            self.quiesce()
+            self.stopped()
+            failed = self.control/'failed-release'
+            self.root.rename(failed)
+            self.old_root.rename(self.root)
+            self.swapped=False;self.old_moved=False
+            self.queue_cache = self.root/'bootstrap/cache/config.php'
+            self.manifest(self.root,self.p['live_manifest'])
+        elif self.old_moved:
+            self.stopped()
+            self.old_root.rename(self.root)
+            self.swapped=False;self.old_moved=False
+            self.queue_cache = self.root/'bootstrap/cache/config.php'
+        if self.workers_stopped or self.pause_requested and any(x['state'] != 'RUNNING' for x in self.statuses().values()):
+            self.quiesce()
+            self.stopped()
+            self.start()
+        elif self.pause_requested:
+            rows = self.statuses()
+            if rows != self.worker_rows:
+                raise Refuse('cannot_resume_changed_worker_pids')
+            for name in rows:
+                self.run(['supervisorctl','signal','CONT',name])
+        if self.gated:
+            time.sleep(getattr(self,'opcache_delay',0))
+            self.restore_nginx_public('rollback_nginx_generations')
+            self.gated = False
+            self.await_public_baseline('public_rollback_observations')
+        if self.cron_paused:
+            self.cron(self.cron_before)
+            self.cron_paused = False
+        if getattr(self, 'state_write_started', False):
+            path = self.state_path()
+            self.trusted_state_directory()
+            if self.state_before is None:
+                path.unlink(missing_ok=True)
+            else:
+                self.atomic(path, self.state_before, path.stat())
+            self.state_write_started = False
+        self.report['rollback_complete'] = True
+        self.checkpoint()
+
+    def execute(self, apply=False):
+        self.control = None
+        self.preflight()
+        if not apply:
+            return {**self.report,'status':'PREFLIGHT_ONLY','production_changed':False}
+        lock_dir = pathlib.Path('/run/lock')
+        fd=os.open(lock_dir/'amorenat-existing-repeat-deploy.lock',os.O_CREAT|os.O_RDWR|os.O_NOFOLLOW,0o600)
+        if os.fstat(fd).st_uid!=0 or not stat.S_ISREG(os.fstat(fd).st_mode):
+            os.close(fd);raise Refuse('untrusted_host_deployment_lock')
+        with os.fdopen(fd,'a+b') as lock:
+            os.fchmod(lock.fileno(),0o600)
+            fcntl.flock(lock,fcntl.LOCK_EX | fcntl.LOCK_NB)
+            self.preflight()
+            try:
+                self.prepare()
+                return self.cutover()
+            except BaseException as exc:
+                self.report.update(status='FAIL',failed_phase=self.phase,error_class=type(exc).__name__)
+                try:
+                    self.rollback()
+                except BaseException as recovery:
+                    self.report.update(hold_no_forced_rewrite=True,rollback_error_class=type(recovery).__name__)
+                    self.checkpoint()
+                raise
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--profile',required=True)
+    parser.add_argument('--archive',required=True)
+    parser.add_argument('--apply',action='store_true')
+    args = parser.parse_args(argv)
+    release = None
+    def cancelled(signum, frame):
+        raise Refuse('deployment_cancelled')
+    for sig in [signal.SIGTERM,signal.SIGHUP]:
+        signal.signal(sig,cancelled)
+    try:
+        profile = json.loads(pathlib.Path(args.profile).read_text())
+        release = ExistingRelease(profile,args.archive)
+        print(json.dumps(release.execute(args.apply)))
+        return 0
+    except BaseException as exc:
+        receipt = release.report if release is not None else {}
+        reason=str(exc) if isinstance(exc,Refuse) and re.fullmatch(r'[a-z0-9_]{1,120}',str(exc)) else 'execution_failed'
+        print(json.dumps({**receipt,'status':'FAIL','error_class':type(exc).__name__,'error_code':reason}))
+        return 1
+
+if __name__ == '__main__':
+    sys.exit(main())

@@ -1,0 +1,182 @@
+import copy, hashlib, importlib.util, io, json, os, pathlib, shutil, tarfile, tempfile, unittest
+from unittest import mock
+MODULE=pathlib.Path(__file__).resolve().parents[2]/'roles/RepeatDeploy/files/repeat_deploy.py'
+spec=importlib.util.spec_from_file_location('repeat_deploy',MODULE);m=importlib.util.module_from_spec(spec);spec.loader.exec_module(m)
+
+def h(data):return hashlib.sha256(data).hexdigest()
+
+class SandboxRelease(m.ExistingRelease):
+    def __init__(self,p,archive,base,*,failure=None,reserved=0):
+        super().__init__(p,archive);self.base=base;self.state_temp=tempfile.TemporaryDirectory(prefix='.repeat-state-',dir='/var/lib');self.failure=failure;self.reserved=reserved;self.events=[];self.next_pid=2000;self.failed_start_once=False
+        self.states={f'{group}:{group}_{i:02}':{'state':'RUNNING','pid':1000+len(self.states) if hasattr(self,'states') else 1000+i} for group,n in p['worker_groups'].items() for i in range(n)}
+        for i,row in enumerate(self.states.values()):row['pid']=1000+i
+        self.cron_current=b'* * * * * cd '+str(self.entry).encode()+b' && /usr/bin/php8.5 artisan schedule:run\n'
+        self.fake_cfg={'app':{'name':'synthetic'},'queue':{'default':'database'},'view':{'compiled':'same'}}
+        self.fresh_cfg=copy.deepcopy(self.fake_cfg)
+        if failure=='config':self.fresh_cfg['queue']['default']='unreviewed'
+    def preflight(self):
+        self.manifest(self.root,self.p['live_manifest']);self.cfg=copy.deepcopy(self.fake_cfg);self.queue_cache=self.root/'bootstrap/cache/config.php';self.old_cache=self.queue_cache.read_bytes();self.uid=os.getuid();self.gid=os.getgid();self.env_anchor=(self.root/'.env').resolve();self.storage_anchor=(self.root/'storage').resolve();self.env_hash=m.digest(self.env_anchor);self.anchor_inodes={'env':self.env_anchor.stat().st_ino,'storage':self.storage_anchor.stat().st_ino};self.worker_rows,self.queue_specs=self.workers();self.nginx_path=self.base/'nginx.conf';self.nginx_before=self.nginx_path.read_bytes();self.nginx_stat=self.nginx_path.stat();self.nginx_gate=self.nginx_before+b'\nreturn 503;\n';self.cron_before=self.cron_current;self.cron_paused_content=b'# own deployment pause\n';self.supervisor_hashes={str(self.base/'supervisor.conf'):m.digest(self.base/'supervisor.conf')};self.standard_public_storage=False;self.check_untracked_runtime();self.report['status']='PREFLIGHT_PASS';return self.report
+    def state_path(self):return pathlib.Path(self.state_temp.name)/'state/current.json'
+    def workers(self):return copy.deepcopy(self.states),{'database':['default','backfill']}
+    def statuses(self):return copy.deepcopy(self.states)
+    def own_queue_pids(self):return {x['pid']:[] for x in self.states.values() if x['state']=='RUNNING'}
+    def counts(self):return {'jobs':2 if self.reserved else 0,'reserved':self.reserved}
+    def producers(self):return []
+    def nginx_worker_pids(self):return set()
+    def fpm_status(self):return {'pool':'fixture','listen queue':0,'total processes':1,'processes':[{'pid':1,'state':'Idle','script':'-'}]}
+    def drain_fpm(self):return super().drain_fpm()
+    def public_codes(self):
+        code=503 if b'return 503' in self.nginx_path.read_bytes() else 500 if self.failure=='public' and self.swapped else 200
+        return {host:{'80':code,'443':code} for host in self.p['server_names']}
+    def php(self,code,args=(),**kwargs):
+        if '$c=require' in code:return json.dumps(self.fresh_cfg).encode()
+        return b''
+    def run(self,args,*,input=None,**kwargs):
+        self.events.append(tuple(args))
+        if args[0]=='crontab':
+            if args[-1]=='-l':return self.cron_current
+            self.cron_current=input;return b''
+        if args[0]=='supervisorctl':
+            action,name=args[1],args[-1]
+            if action=='pid':return str(self.states[name]['pid']).encode()
+            if action=='stop':self.states[name]={'state':'STOPPED','pid':0};return b''
+            if action=='start':
+                if self.failure=='start' and not self.failed_start_once:
+                    self.states[name]={'state':'BACKOFF','pid':0};self.failed_start_once=True;return b''
+                self.next_pid+=1;self.states[name]={'state':'RUNNING','pid':self.next_pid};return b''
+            return b''
+        if args[0] in ['sudo','unshare']:
+            target=next(x.partition('=')[2] for x in args if x.startswith('APP_CONFIG_CACHE='))
+            if any('getCachedConfigPath' in x for x in args):return json.dumps([x.partition('=')[2] for x in args if x.startswith(('APP_CONFIG_CACHE=','APP_SERVICES_CACHE=','APP_PACKAGES_CACHE=','APP_EVENTS_CACHE=','APP_ROUTES_CACHE='))]).encode()
+            if 'config:cache' in args:pathlib.Path(target).write_bytes(b'synthetic-new-cache');return b''
+        return b''
+    def start(self):
+        if self.failure=='start' and not self.failed_start_once:
+            name=next(iter(self.states));self.run(['supervisorctl','start',name]);raise m.Refuse('simulated_start_backoff')
+        return super().start()
+
+class ContractTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp=tempfile.TemporaryDirectory(prefix='.repeat-package-test-',dir='/var/www');self.base=pathlib.Path(self.tmp.name);self.live=self.base/'application';self.live.mkdir();(self.live/'app').mkdir();(self.live/'bootstrap/cache').mkdir(parents=True);(self.live/'storage/app').mkdir(parents=True);(self.live/'.env').write_bytes(b'SYNTHETIC_NOT_A_REAL_CREDENTIAL=fixture\n');(self.live/'.env').chmod(0o640);(self.live/'storage/app/customer-data.txt').write_bytes(b'synthetic-user-data');(self.live/'storage/app/customer-data.txt').chmod(0o664);(self.live/'bootstrap/cache/config.php').write_bytes(b'synthetic-old-cache');(self.live/'bootstrap/cache/config.php').chmod(0o640);(self.live/'vendor/composer').mkdir(parents=True);(self.live/'vendor/composer/autoload_real.php').write_text('<?php');(self.live/'vendor/composer/platform_check.php').write_text('<?php');(self.base/'nginx.conf').write_bytes(b'server { server_name fixture.example.invalid; }');(self.base/'supervisor.conf').write_bytes(b'synthetic-existing-topology')
+        self.old={'app/Marker.php':b'<?php // old\n','composer.json':b'{"require":{"php":"^8.5"}}\r\n','composer.lock':b'{"packages":[]}\r\n','bootstrap/app.php':b'<?php // synthetic bootstrap\n'}
+        self.new={**self.old,'app/Marker.php':b'<?php // new\n'}
+        for name,data in self.old.items():p=self.live/name;p.parent.mkdir(parents=True,exist_ok=True);p.write_bytes(data)
+        self.archive=self.base/'source.tar.gz'
+        with tarfile.open(self.archive,'w:gz') as t:
+            for name,data in self.new.items():
+                data=data.replace(b'\r\n',b'\n');info=tarfile.TarInfo(name);info.size=len(data);info.mode=0o666;t.addfile(info,io.BytesIO(data))
+        manifest=lambda files,sha:{'candidate_commit':sha*40,'files':{n:h(v.replace(b'\r\n',b'\n')) for n,v in files.items()},'normalization_by_path':{n:'crlf_to_lf' for n in files}}
+        self.profile={'schema_version':1,'project':'fixture','application_root':str(self.live),'php_cli':'/usr/bin/php8.5','php_minor':'8.5','fpm_socket':'/run/php/php8.5-fpm.sock','nginx_config':'/etc/nginx/sites-enabled/fixture.conf','server_names':['fixture.example.invalid'],'public_baselines':{'fixture.example.invalid':{'80':200,'443':200}},'worker_groups':{'fixture':1},'supervisor_config_hashes':{'/etc/supervisor/conf.d/fixture.conf':'a'*64},'live_manifest':manifest(self.old,'a'),'candidate_manifest':manifest(self.new,'b'),'source_archive_sha256':m.digest(self.archive),'backup_reference':'synthetic-verified-backup','server_identity_sha256':'c'*64,'fpm_status_path':'/existing-status','fpm_pool':'fixture','minimum_free_bytes':0,'drain_timeout':.01,'start_timeout':.01}
+    def tearDown(self):
+        target=self.base.resolve();assert target.parent==pathlib.Path('/var/www') and target.name.startswith('.repeat-package-test-');self.tmp.cleanup()
+    def release(self,**kwargs):
+        release=SandboxRelease(self.profile,self.archive,self.base,**kwargs)
+        self.addCleanup(release.state_temp.cleanup)
+        return release
+    def apply(self,r):
+        r.control=None;r.preflight()
+        try:r.prepare();return r.cutover()
+        except BaseException:r.rollback();raise
+    def assert_original(self,r):
+        self.assertEqual((self.live/'app/Marker.php').read_bytes(),self.old['app/Marker.php']);self.assertEqual((self.live/'.env').read_bytes(),b'SYNTHETIC_NOT_A_REAL_CREDENTIAL=fixture\n');self.assertEqual((self.live/'storage/app/customer-data.txt').read_bytes(),b'synthetic-user-data');self.assertEqual(r.cron_current,r.cron_before);self.assertEqual(r.nginx_path.read_bytes(),r.nginx_before);self.assertTrue(all(x['state']=='RUNNING' for x in r.statuses().values()))
+    def test_success_preserves_anchor_inodes_and_runtime_permissions(self):
+        env=(self.live/'.env').stat().st_ino;storage=(self.live/'storage').stat().st_ino;r=self.release();out=self.apply(r);self.assertEqual(out['status'],'PASS');self.assertEqual((self.live/'.env').stat().st_ino,env);self.assertEqual((self.live/'storage').stat().st_ino,storage);self.assertEqual((self.live/'app/Marker.php').stat().st_mode&0o777,0o644);self.assertEqual((self.live/'storage/app/customer-data.txt').stat().st_mode&0o777,0o664);self.assertEqual((self.live/'bootstrap/cache/config.php').stat().st_mode&0o777,0o640);self.assertTrue(r.old_root.is_dir());self.assertEqual(r.cron_current,r.cron_before)
+    def test_recorded_state_advances_and_rejects_redirected_directory(self):
+        r=self.release();self.apply(r)
+        state=json.loads(r.state_path().read_text())
+        self.assertEqual(state['source_manifest'],self.profile['candidate_manifest'])
+        self.assertEqual(r.state_path().stat().st_mode&0o777,0o600)
+        r.recorded_manifest();self.assertEqual(r.p['live_manifest'],self.profile['candidate_manifest'])
+        r.state_path().unlink();r.state_path().parent.rmdir()
+        target=self.base/'redirect';target.mkdir(mode=0o700);r.state_path().parent.symlink_to(target)
+        with self.assertRaises(m.Refuse):r.recorded_manifest()
+    def test_state_commit_failure_rolls_back_state_and_source(self):
+        r=self.release();original=r.persist_state
+        def fail_after_replace():
+            original();raise m.Refuse('simulated_state_commit_error')
+        r.persist_state=fail_after_replace
+        with self.assertRaises(m.Refuse):self.apply(r)
+        self.assert_original(r);self.assertFalse(r.state_path().exists())
+    def test_fpm_drain_identifies_only_owned_script_and_refuses_unknown(self):
+        r=self.release()
+        rows={'listen queue':0,'processes':[{'pid':1,'state':'Running','script':str(self.live/'public/index.php'),'request uri':'/work'},{'pid':2,'state':'Running','script':'/srv/other/public/index.php','request uri':'/work'},{'pid':3,'state':'Running','script':'-','request uri':'/existing-status?full&json'}]}
+        self.assertEqual(r.active_fpm_requests(rows),[1])
+        rows['listen queue']=1;self.assertEqual(r.active_fpm_requests(rows),['pending_fpm_requests',1]);rows['listen queue']=0
+        rows['processes'].append({'pid':4,'state':'Running','script':'-','request uri':'/unknown'})
+        with self.assertRaises(m.Refuse):r.active_fpm_requests(rows)
+        with mock.patch('shutil.which',return_value=None):
+            with self.assertRaises(m.Refuse):m.ExistingRelease.fpm_status(r)
+    def test_database_url_socket_options_and_redis_are_refused(self):
+        r=self.release();r.cfg={'database':{'default':'mysql','connections':{'mysql':{'driver':'mysql','host':'localhost','database':'synthetic','username':'synthetic'}}},'queue':{'connections':{'database':{'driver':'database','table':'jobs'}}}};r.queue_specs={'database':['default']}
+        r.validate_queue_connections()
+        for field,value in [('url','mysql://synthetic'),('unix_socket','/synthetic.sock'),('prefix','p_'),('options',{'1':2}),('read',{'host':'other'})]:
+            db=r.cfg['database']['connections']['mysql'];db[field]=value
+            with self.assertRaises(m.Refuse):r.validate_queue_connections()
+            del db[field]
+        r.cfg['queue']['connections']['database']['driver']='redis'
+        with self.assertRaises(m.Refuse):r.validate_queue_connections()
+    def test_two_successive_php_releases_have_different_file_mtimes(self):
+        first=self.release();old=int((self.live/'app/Marker.php').stat().st_mtime);self.apply(first);middle=int((self.live/'app/Marker.php').stat().st_mtime);self.assertNotEqual(old,middle)
+        self.profile['live_manifest']=copy.deepcopy(self.profile['candidate_manifest']);self.new['app/Marker.php']=b'<?php // next release\n'
+        with tarfile.open(self.archive,'w:gz')as archive:
+            for name,data in self.new.items():
+                data=data.replace(b'\r\n',b'\n');item=tarfile.TarInfo(name);item.size=len(data);item.mtime=0;archive.addfile(item,io.BytesIO(data))
+        self.profile['source_archive_sha256']=m.digest(self.archive);self.profile['candidate_manifest']['candidate_commit']='c'*40;self.profile['candidate_manifest']['files']['app/Marker.php']=h(self.new['app/Marker.php'])
+        second=self.release();self.apply(second);self.assertNotEqual(middle,int((self.live/'app/Marker.php').stat().st_mtime));self.assertEqual((self.live/'app/Marker.php').read_bytes(),self.new['app/Marker.php'])
+    def test_fpm_opcache_off_unbounded_or_ambiguous_is_refused(self):
+        info='opcache.enable => On => On\nopcache.validate_timestamps => On => On\nopcache.revalidate_freq => 2 => 2\n'
+        self.assertEqual(m.ExistingRelease.validate_opcache_values(info,{}),4)
+        for overrides in [{'opcache.validate_timestamps':'Off'},{'opcache.revalidate_freq':'60'},{'opcache.revalidate_freq':'$unknown'}]:
+            with self.assertRaises(m.Refuse):m.ExistingRelease.validate_opcache_values(info,overrides)
+        with self.assertRaises(m.Refuse):m.ExistingRelease.validate_opcache_values(info+info,{})
+    def test_async_nginx_reload_requires_two_stable_baseline_probes(self):
+        r=self.release();baseline=r.p['public_baselines'];temporary={key:{'80':503,'443':503}for key in baseline}
+        with mock.patch.object(r,'public_codes',side_effect=[temporary,baseline,baseline]),mock.patch('time.sleep'):
+            r.await_public_baseline('fixture_observed')
+        self.assertEqual(r.report['fixture_observed'],[temporary,baseline,baseline])
+        with mock.patch.object(r,'public_codes',return_value=temporary),mock.patch('time.sleep'),mock.patch('time.monotonic',side_effect=[0,1,20]):
+            with self.assertRaises(m.Refuse):r.await_public_baseline('fixture_failed')
+        self.assertEqual(r.report['fixture_failed'],[temporary])
+    def test_public_alias_symlink_is_not_replaced(self):
+        alias=self.base/'public-app';alias.symlink_to(self.live);self.profile['application_root']=str(alias);inode=alias.lstat().st_ino;r=self.release();self.apply(r);self.assertEqual(alias.lstat().st_ino,inode);self.assertEqual(alias.resolve(),self.live)
+    def test_config_failure_restores_old_cache_and_source(self):
+        r=self.release(failure='config')
+        with self.assertRaises(m.Refuse):self.apply(r)
+        self.assert_original(r);self.assertEqual((self.live/'bootstrap/cache/config.php').read_bytes(),b'synthetic-old-cache')
+    def test_backoff_is_stopped_explicitly_before_rollback(self):
+        r=self.release(failure='start')
+        with self.assertRaises(m.Refuse):self.apply(r)
+        self.assert_original(r);self.assertTrue(any(x[:2]==('supervisorctl','stop') for x in r.events))
+    def test_public_failure_requiesces_new_worker_before_rollback(self):
+        r=self.release(failure='public')
+        with self.assertRaises(m.Refuse):self.apply(r)
+        self.assert_original(r)
+    def test_busy_queue_resumes_same_workers_without_source_change(self):
+        r=self.release(reserved=1)
+        with self.assertRaises(m.Refuse):self.apply(r)
+        self.assert_original(r);self.assertTrue(any('CONT' in x for x in r.events))
+    def test_twelve_process_seven_group_topology_is_preserved(self):
+        self.profile['worker_groups']={f'group-{i}':n for i,n in enumerate([2,2,2,3,1,1,1])};r=self.release();self.apply(r);self.assertEqual(len(r.statuses()),12);self.assertEqual(len(self.profile['worker_groups']),7)
+    def test_dependency_change_fails_before_any_worker_signal(self):
+        with tarfile.open(self.archive,'w:gz') as t:
+            for name,data in {**self.new,'composer.lock':b'{"packages":["different"]}'}.items():
+                info=tarfile.TarInfo(name);info.size=len(data);t.addfile(info,io.BytesIO(data))
+        self.profile['source_archive_sha256']=m.digest(self.archive);r=self.release()
+        with self.assertRaises(m.Refuse):self.apply(r)
+        self.assertEqual(r.events,[]);self.assertEqual((self.live/'app/Marker.php').read_bytes(),self.old['app/Marker.php'])
+    def test_unknown_runtime_file_requires_explicit_preservation(self):
+        (self.live/'public').mkdir();(self.live/'public/customer.txt').write_text('synthetic');r=self.release()
+        with self.assertRaises(m.Refuse):r.preflight()
+        self.assertEqual(r.events,[])
+    def test_source_digest_drift_refuses_before_mutation(self):
+        (self.live/'app/Marker.php').write_text('unexpected');r=self.release()
+        with self.assertRaises(m.Refuse):r.preflight()
+        self.assertEqual(r.events,[])
+    def test_provisioning_flags_and_wildcards_are_rejected(self):
+        for field,value in [('run_migrations',True),('update_env',True),('manage_supervisor',True),('server_names',['*.example.invalid'])]:
+            p=copy.deepcopy(self.profile);p[field]=value
+            with self.assertRaises(m.Refuse):m.validate_profile(p)
+    def test_typed_config_is_strict_except_explicit_same_inode_path(self):
+        r=self.release();self.assertFalse(r.config_equal({'n':1},{'n':'1'}));self.assertFalse(r.config_equal([1,2],[2,1]));self.assertFalse(r.config_equal({'x':False},{'x':0}))
+
+if __name__=='__main__':unittest.main()
