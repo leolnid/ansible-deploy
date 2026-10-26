@@ -2,12 +2,26 @@ import copy, hashlib, importlib.util, io, json, os, pathlib, shutil, tarfile, te
 from unittest import mock
 MODULE=pathlib.Path(__file__).resolve().parents[2]/'roles/RepeatDeploy/files/repeat_deploy.py'
 spec=importlib.util.spec_from_file_location('repeat_deploy',MODULE);m=importlib.util.module_from_spec(spec);spec.loader.exec_module(m)
+FIXTURE_ROOT=pathlib.Path(os.environ.get('REPEAT_DEPLOY_TEST_ROOT',tempfile.gettempdir())).resolve()
 
 def h(data):return hashlib.sha256(data).hexdigest()
 
 class SandboxRelease(m.ExistingRelease):
     def __init__(self,p,archive,base,*,failure=None,reserved=0):
-        super().__init__(p,archive);self.base=base;self.state_temp=tempfile.TemporaryDirectory(prefix='.repeat-state-',dir='/var/lib');self.failure=failure;self.reserved=reserved;self.events=[];self.next_pid=2000;self.failed_start_once=False
+        # The production executor only accepts app roots under /var/www,
+        # /home/user/www or /srv. Validate all fields against the synthetic
+        # /srv path, then bind this test instance to its private fixture tree.
+        # The production validator itself remains unchanged and is separately
+        # tested to refuse the /root fixture path.
+        synthetic_root='/srv/repeat-deploy-private-fixture/application'
+        sandbox_profile=copy.deepcopy(p);sandbox_profile['application_root']=synthetic_root
+        original_resolve=pathlib.Path.resolve
+        def resolve_synthetic(path,strict=False):
+            if str(path)==synthetic_root:return pathlib.Path(synthetic_root)
+            return original_resolve(path,strict=strict)
+        with mock.patch.object(pathlib.Path,'resolve',resolve_synthetic):super().__init__(sandbox_profile,archive)
+        self.p['application_root']=p['application_root'];self.entry=pathlib.Path(p['application_root']);self.root=self.entry.resolve(strict=True)
+        self.base=base;self.state_temp=tempfile.TemporaryDirectory(prefix='.repeat-state-',dir=FIXTURE_ROOT);self.failure=failure;self.reserved=reserved;self.events=[];self.next_pid=2000;self.failed_start_once=False
         self.states={f'{group}:{group}_{i:02}':{'state':'RUNNING','pid':1000+len(self.states) if hasattr(self,'states') else 1000+i} for group,n in p['worker_groups'].items() for i in range(n)}
         for i,row in enumerate(self.states.values()):row['pid']=1000+i
         self.cron_current=b'* * * * * cd '+str(self.entry).encode()+b' && /usr/bin/php8.5 artisan schedule:run\n'
@@ -17,6 +31,29 @@ class SandboxRelease(m.ExistingRelease):
     def preflight(self):
         self.manifest(self.root,self.p['live_manifest']);self.cfg=copy.deepcopy(self.fake_cfg);self.queue_cache=self.root/'bootstrap/cache/config.php';self.old_cache=self.queue_cache.read_bytes();self.uid=os.getuid();self.gid=os.getgid();self.env_anchor=(self.root/'.env').resolve();self.storage_anchor=(self.root/'storage').resolve();self.env_hash=m.digest(self.env_anchor);self.anchor_inodes={'env':self.env_anchor.stat().st_ino,'storage':self.storage_anchor.stat().st_ino};self.worker_rows,self.queue_specs=self.workers();self.nginx_path=self.base/'nginx.conf';self.nginx_before=self.nginx_path.read_bytes();self.nginx_stat=self.nginx_path.stat();self.nginx_gate=self.nginx_before+b'\nreturn 503;\n';self.cron_before=self.cron_current;self.cron_paused_content=b'# own deployment pause\n';self.supervisor_hashes={str(self.base/'supervisor.conf'):m.digest(self.base/'supervisor.conf')};self.standard_public_storage=False;self.check_untracked_runtime();self.configuration_source_changes={name for name in set(self.p['live_manifest']['files'])|set(self.p['candidate_manifest']['files'])if self.p['live_manifest']['files'].get(name)!=self.p['candidate_manifest']['files'].get(name)and(name.startswith(('config/','app/Providers/'))or name in['bootstrap/providers.php','bootstrap/app.php'])};self.report['status']='PREFLIGHT_PASS';return self.report
     def state_path(self):return pathlib.Path(self.state_temp.name)/'state/current.json'
+    def trusted_state_directory(self,create=False):
+        # The Linux runner intentionally keeps everything beneath /root, whose
+        # mode on the S1 host is 0775. Production validation checks all system
+        # ancestors; this test-only mirror treats the dedicated 0700 fixture
+        # root as its trust anchor and checks every directory below it.
+        root=FIXTURE_ROOT;path=self.state_path().parent
+        if root not in path.parents or root.is_symlink() or not root.is_dir() or root.stat().st_uid!=0 or root.stat().st_mode&0o022 or (root.stat().st_mode&0o777)!=0o700:
+            raise m.Refuse('untrusted_recorded_state_directory')
+        relative=path.relative_to(root);parts=[root]
+        for item in relative.parts:parts.append(parts[-1]/item)
+        for part in parts[1:]:
+            if not part.exists():
+                if create:part.mkdir(mode=0o700)
+                else:continue
+            if part.is_symlink() or not part.is_dir() or part.stat().st_uid!=0 or part.stat().st_mode&0o022:
+                raise m.Refuse('untrusted_recorded_state_directory')
+        if path.exists() and path.stat().st_mode&0o777!=0o700:raise m.Refuse('private_recorded_state_directory_required')
+    def recorded_manifest(self):
+        original_validate=m.validate_profile
+        def validate_sandbox_profile(profile):
+            sandbox_profile=copy.deepcopy(profile);sandbox_profile['application_root']='/srv/repeat-deploy-private-fixture/application'
+            checked=original_validate(sandbox_profile);checked['application_root']=profile['application_root'];return checked
+        with mock.patch.object(m,'validate_profile',validate_sandbox_profile):return super().recorded_manifest()
     def workers(self):return copy.deepcopy(self.states),{'database':['default','backfill']}
     def statuses(self):return copy.deepcopy(self.states)
     def own_queue_pids(self):return {x['pid']:[] for x in self.states.values() if x['state']=='RUNNING'}
@@ -60,7 +97,7 @@ class SandboxRelease(m.ExistingRelease):
 
 class ContractTests(unittest.TestCase):
     def setUp(self):
-        self.tmp=tempfile.TemporaryDirectory(prefix='.repeat-package-test-',dir='/var/www');self.base=pathlib.Path(self.tmp.name);self.live=self.base/'application';self.live.mkdir();(self.live/'app').mkdir();(self.live/'bootstrap/cache').mkdir(parents=True);(self.live/'storage/app').mkdir(parents=True);(self.live/'.env').write_bytes(b'SYNTHETIC_NOT_A_REAL_CREDENTIAL=fixture\n');(self.live/'.env').chmod(0o640);(self.live/'storage/app/customer-data.txt').write_bytes(b'synthetic-user-data');(self.live/'storage/app/customer-data.txt').chmod(0o664);(self.live/'bootstrap/cache/config.php').write_bytes(b'synthetic-old-cache');(self.live/'bootstrap/cache/config.php').chmod(0o640);(self.live/'vendor/composer').mkdir(parents=True);(self.live/'vendor/composer/autoload_real.php').write_text('<?php');(self.live/'vendor/composer/platform_check.php').write_text('<?php');(self.base/'nginx.conf').write_bytes(b'server { server_name fixture.example.invalid; }');(self.base/'supervisor.conf').write_bytes(b'synthetic-existing-topology')
+        self.tmp=tempfile.TemporaryDirectory(prefix='.repeat-package-test-',dir=FIXTURE_ROOT);self.base=pathlib.Path(self.tmp.name);self.live=self.base/'application';self.live.mkdir();(self.live/'app').mkdir();(self.live/'bootstrap/cache').mkdir(parents=True);(self.live/'storage/app').mkdir(parents=True);(self.live/'.env').write_bytes(b'SYNTHETIC_NOT_A_REAL_CREDENTIAL=fixture\n');(self.live/'.env').chmod(0o640);(self.live/'storage/app/customer-data.txt').write_bytes(b'synthetic-user-data');(self.live/'storage/app/customer-data.txt').chmod(0o664);(self.live/'bootstrap/cache/config.php').write_bytes(b'synthetic-old-cache');(self.live/'bootstrap/cache/config.php').chmod(0o640);(self.live/'vendor/composer').mkdir(parents=True);(self.live/'vendor/composer/autoload_real.php').write_text('<?php');(self.live/'vendor/composer/platform_check.php').write_text('<?php');(self.base/'nginx.conf').write_bytes(b'server { server_name fixture.example.invalid; }');(self.base/'supervisor.conf').write_bytes(b'synthetic-existing-topology')
         self.old={'app/Marker.php':b'<?php // old\n','composer.json':b'{"require":{"php":"^8.5"}}\r\n','composer.lock':b'{"packages":[]}\r\n','bootstrap/app.php':b'<?php // synthetic bootstrap\n'}
         self.new={**self.old,'app/Marker.php':b'<?php // new\n'}
         for name,data in self.old.items():p=self.live/name;p.parent.mkdir(parents=True,exist_ok=True);p.write_bytes(data)
@@ -71,7 +108,7 @@ class ContractTests(unittest.TestCase):
         manifest=lambda files,sha:{'candidate_commit':sha*40,'files':{n:h(v.replace(b'\r\n',b'\n')) for n,v in files.items()},'normalization_by_path':{n:'crlf_to_lf' for n in files}}
         self.profile={'schema_version':1,'project':'fixture','application_root':str(self.live),'php_cli':'/usr/bin/php8.5','php_minor':'8.5','fpm_socket':'/run/php/php8.5-fpm.sock','nginx_config':'/etc/nginx/sites-enabled/fixture.conf','server_names':['fixture.example.invalid'],'public_baselines':{'fixture.example.invalid':{'80':200,'443':200}},'worker_groups':{'fixture':1},'supervisor_config_hashes':{'/etc/supervisor/conf.d/fixture.conf':'a'*64},'live_manifest':manifest(self.old,'a'),'candidate_manifest':manifest(self.new,'b'),'source_archive_sha256':m.digest(self.archive),'backup_reference':'synthetic-verified-backup','server_identity_sha256':'c'*64,'fpm_status_path':'/existing-status','fpm_pool':'fixture','minimum_free_bytes':0,'drain_timeout':.01,'start_timeout':.01}
     def tearDown(self):
-        target=self.base.resolve();assert target.parent==pathlib.Path('/var/www') and target.name.startswith('.repeat-package-test-');self.tmp.cleanup()
+        target=self.base.resolve();assert target.parent==FIXTURE_ROOT and target.name.startswith('.repeat-package-test-');self.tmp.cleanup()
     def release(self,**kwargs):
         release=SandboxRelease(self.profile,self.archive,self.base,**kwargs)
         self.addCleanup(release.state_temp.cleanup)
@@ -93,6 +130,12 @@ class ContractTests(unittest.TestCase):
         r.state_path().unlink();r.state_path().parent.rmdir()
         target=self.base/'redirect';target.mkdir(mode=0o700);r.state_path().parent.symlink_to(target)
         with self.assertRaises(m.Refuse):r.recorded_manifest()
+    def test_production_state_guard_rejects_group_writable_fixture_ancestor(self):
+        r=self.release();path=pathlib.Path(r.state_temp.name);path.chmod(0o770)
+        try:
+            with self.assertRaises(m.Refuse):m.ExistingRelease.trusted_state_directory(r,create=False)
+            self.assertFalse(r.state_path().parent.exists())
+        finally:path.chmod(0o700)
     def test_state_commit_failure_rolls_back_state_and_source(self):
         r=self.release();original=r.persist_state
         def fail_after_replace():
@@ -195,6 +238,8 @@ class ContractTests(unittest.TestCase):
         for field,value in [('run_migrations',True),('update_env',True),('manage_supervisor',True),('server_names',['*.example.invalid'])]:
             p=copy.deepcopy(self.profile);p[field]=value
             with self.assertRaises(m.Refuse):m.validate_profile(p)
+    def test_production_validator_rejects_private_root_fixture(self):
+        with self.assertRaises(m.Refuse):m.validate_profile(self.profile)
     def test_typed_config_is_strict_except_explicit_same_inode_path(self):
         r=self.release();self.assertFalse(r.config_equal({'n':1},{'n':'1'}));self.assertFalse(r.config_equal([1,2],[2,1]));self.assertFalse(r.config_equal({'x':False},{'x':0}))
 

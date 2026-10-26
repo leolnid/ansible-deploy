@@ -3,6 +3,8 @@ import importlib.util
 import json
 import pathlib
 import subprocess
+import os
+import shutil
 import tempfile
 import unittest
 
@@ -11,7 +13,8 @@ MODULE = ROOT / 'roles/RepeatDeploy/files/native_configuration.py'
 spec = importlib.util.spec_from_file_location('native_configuration', MODULE)
 native = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(native)
-PHP = pathlib.Path(r'C:\Development\_tools\php85\php.exe')
+PHP = pathlib.Path(os.environ.get('REPEAT_DEPLOY_TEST_PHP') or shutil.which('php') or '')
+FIXTURE_ROOT = pathlib.Path(os.environ.get('REPEAT_DEPLOY_TEST_ROOT', tempfile.gettempdir())).resolve()
 
 
 def tagged_bool(value):
@@ -41,7 +44,7 @@ class NativeConfigurationTests(unittest.TestCase):
     def setUp(self):
         if not PHP.is_file():
             self.skipTest('shared PHP 8.5 runtime is unavailable')
-        self.tmp = tempfile.TemporaryDirectory(prefix='native-config-fixture-')
+        self.tmp = tempfile.TemporaryDirectory(prefix='native-config-fixture-', dir=FIXTURE_ROOT)
         self.root = pathlib.Path(self.tmp.name)
         self.old = self.root / 'old.php'
         self.new = self.root / 'new.php'
@@ -64,7 +67,7 @@ class NativeConfigurationTests(unittest.TestCase):
 
     def tearDown(self):
         target = pathlib.Path(self.tmp.name).resolve()
-        self.assertEqual(target.parent, pathlib.Path(tempfile.gettempdir()).resolve())
+        self.assertEqual(target.parent, FIXTURE_ROOT)
         self.assertTrue(target.name.startswith('native-config-fixture-'))
         self.tmp.cleanup()
 

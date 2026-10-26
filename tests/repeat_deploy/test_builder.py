@@ -1,12 +1,13 @@
 import hashlib,importlib.util,json,os,pathlib,subprocess,tarfile,tempfile,unittest
 MODULE=pathlib.Path(__file__).resolve().parents[2]/'scripts/build-existing-release.py'
 spec=importlib.util.spec_from_file_location('builder',MODULE);m=importlib.util.module_from_spec(spec);spec.loader.exec_module(m)
+FIXTURE_ROOT=pathlib.Path(os.environ.get('REPEAT_DEPLOY_TEST_ROOT',tempfile.gettempdir())).resolve()
 class BuilderTests(unittest.TestCase):
  def setUp(self):
-  self.tmp=tempfile.TemporaryDirectory(prefix='repeat-builder-');self.base=pathlib.Path(self.tmp.name).resolve();assert self.base.parent==pathlib.Path(tempfile.gettempdir()).resolve() and self.base.name.startswith('repeat-builder-');self.addCleanup(self.safe_cleanup);self.repo=self.base/'app';self.repo.mkdir();self.git(self.repo,'init','-q')
+  self.tmp=tempfile.TemporaryDirectory(prefix='repeat-builder-',dir=FIXTURE_ROOT);self.base=pathlib.Path(self.tmp.name).resolve();assert self.base.parent==FIXTURE_ROOT and self.base.name.startswith('repeat-builder-');self.addCleanup(self.safe_cleanup);self.repo=self.base/'app';self.repo.mkdir();self.git(self.repo,'init','-q')
   for name,content in {'artisan':b'<?php','bootstrap/app.php':b'<?php','composer.json':b'{}','composer.lock':b'{}','.deploy/runtime-profile.json':b'{"fixture":true}','.deploy/known_hosts':b'fixture public host key'}.items():p=self.repo/name;p.parent.mkdir(parents=True,exist_ok=True);p.write_bytes(content)
  def safe_cleanup(self):
-  target=pathlib.Path(self.tmp.name).resolve();assert target==self.base and target.parent==pathlib.Path(tempfile.gettempdir()).resolve() and target.name.startswith('repeat-builder-');self.tmp.cleanup()
+  target=pathlib.Path(self.tmp.name).resolve();assert target==self.base and target.parent==FIXTURE_ROOT and target.name.startswith('repeat-builder-');self.tmp.cleanup()
  def git(self,repo,*args):return subprocess.check_output(['git','-C',str(repo),*args],stderr=subprocess.PIPE).decode().strip()
  def commit(self,repo):self.git(repo,'add','-A');self.git(repo,'-c','user.name=Fixture','-c','user.email=fixture@local.invalid','commit','-qm','synthetic fixture');return self.git(repo,'rev-parse','HEAD')
  def lfs(self):

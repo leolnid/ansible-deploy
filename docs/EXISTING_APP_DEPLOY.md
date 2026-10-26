@@ -58,12 +58,12 @@ It does not run Composer, migrations, seeders, frontend builds, route/event
 cache commands, cache flushes, initial provisioning or external business calls.
 
 When no configuration source or typed delta changes, the existing default
-config cache is preserved byte-for-byte with its mode and ownership. For a
-configuration-source change, bootstrap uses distinct temporary cache paths
-and a private, per-run `LARAVEL_STORAGE_PATH` tree. If the effective native
-configuration is unchanged, the old cache remains exact. Otherwise only
-explicitly reviewed typed config nodes are promoted into a copy of the old
-cache; every other old node must remain equal in PHP type and value. Credentials,
+config cache is preserved byte-for-byte with its mode and ownership. A changed
+config, bootstrap or provider source requires a nonempty explicit typed
+`config_change_hashes` scope. Bootstrap then uses distinct temporary cache
+paths and a private, per-run `LARAVEL_STORAGE_PATH` tree. Only explicitly
+reviewed typed config nodes are promoted into a copy of the old cache; every
+other old node must remain equal in PHP type and value. Credentials,
 DB/queue/cache/session settings and coordination/concurrency are never delta
 allowlisted. Unknown app providers can execute code during boot: review those
 providers before enrolling an application.

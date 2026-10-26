@@ -1,8 +1,12 @@
 # Reusable, opt-in existing-application delivery. Callers pin this file and the
 # package checkout to the same immutable ansible-deploy commit.
 .repeat-deploy-package:
-  image: willhallonline/ansible:latest
+  image:
+    name: willhallonline/ansible@sha256:0b8923ad5642ec78d4db1d6c495a4aa3abc3a6d9845a3d4845679a24a75725c0
+    docker:
+      user: "0"
   variables:
+    GIT_DEPTH: '0'
     GIT_SUBMODULE_STRATEGY: none
   before_script: []
   rules:
@@ -14,13 +18,24 @@ repeat-deploy:artifact:
   before_script:
     - test -f .deploy/runtime-profile.json
     - test -f .deploy/known_hosts
-    - git submodule update --init --depth 1 packages/leolnid/common
+    - command -v python3
+    - command -v git
+    - test -w "$CI_PROJECT_DIR"
+    - |
+      if git ls-tree "$CI_COMMIT_SHA" packages/leolnid/common | awk '$1 == "160000" { found=1 } END { exit !found }'; then
+        git submodule update --init --depth 1 packages/leolnid/common
+      fi
     - git clone --no-checkout https://github.com/leolnid/ansible-deploy.git .repeat-deploy-package
     - git -C .repeat-deploy-package fetch --depth 1 origin "$REPEAT_DEPLOY_PACKAGE_REF"
     - git -C .repeat-deploy-package checkout --detach "$REPEAT_DEPLOY_PACKAGE_REF"
     - test "$(git -C .repeat-deploy-package rev-parse HEAD)" = "$REPEAT_DEPLOY_PACKAGE_REF"
   script:
-    - python3 .repeat-deploy-package/scripts/build-existing-release.py --repo "$CI_PROJECT_DIR" --commit "$CI_COMMIT_SHA" --output release --common-checkout "$CI_PROJECT_DIR/packages/leolnid/common"
+    - |
+      if git ls-tree "$CI_COMMIT_SHA" packages/leolnid/common | awk '$1 == "160000" { found=1 } END { exit !found }'; then
+        python3 .repeat-deploy-package/scripts/build-existing-release.py --repo "$CI_PROJECT_DIR" --commit "$CI_COMMIT_SHA" --output release --common-checkout "$CI_PROJECT_DIR/packages/leolnid/common"
+      else
+        python3 .repeat-deploy-package/scripts/build-existing-release.py --repo "$CI_PROJECT_DIR" --commit "$CI_COMMIT_SHA" --output release
+      fi
   artifacts:
     paths:
       - release/
@@ -35,7 +50,17 @@ repeat-deploy:artifact:
   before_script:
     - test -f .deploy/runtime-profile.json
     - test -f .deploy/known_hosts
-    - git submodule update --init --depth 1 packages/leolnid/common
+    - command -v python3
+    - command -v git
+    - command -v ansible-playbook
+    - command -v ssh-agent
+    - command -v ssh-add
+    - command -v ssh-keygen
+    - test -w "$CI_PROJECT_DIR"
+    - |
+      if git ls-tree "$CI_COMMIT_SHA" packages/leolnid/common | awk '$1 == "160000" { found=1 } END { exit !found }'; then
+        git submodule update --init --depth 1 packages/leolnid/common
+      fi
     - git clone --no-checkout https://github.com/leolnid/ansible-deploy.git .repeat-deploy-package
     - git -C .repeat-deploy-package fetch --depth 1 origin "$REPEAT_DEPLOY_PACKAGE_REF"
     - git -C .repeat-deploy-package checkout --detach "$REPEAT_DEPLOY_PACKAGE_REF"
@@ -58,7 +83,7 @@ repeat-deploy:artifact:
     - ssh-keygen -F "$REPEAT_DEPLOY_HOST" -f "$CI_PROJECT_DIR/.deploy/known_hosts" >/dev/null
     - export ANSIBLE_HOST_KEY_CHECKING=True
     - export ANSIBLE_SSH_ARGS="-o StrictHostKeyChecking=yes -o UserKnownHostsFile=$CI_PROJECT_DIR/.deploy/known_hosts"
-    - python3 .repeat-deploy-package/scripts/render-repeat-profile.py --enrollment .deploy/runtime-profile.json --artifact-directory release --output-directory release/target
+    - python3 .repeat-deploy-package/scripts/render-repeat-profile.py --enrollment .deploy/runtime-profile.json --artifact-directory release --output-directory release/target --expected-commit "$CI_COMMIT_SHA"
 repeat-deploy:preflight:
   extends: .repeat-deploy-run
   rules:

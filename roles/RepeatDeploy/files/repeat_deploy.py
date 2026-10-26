@@ -616,6 +616,7 @@ class ExistingRelease:
         self.old_cache = self.queue_cache.read_bytes()
         self.standard_public_storage = (self.root/'public/storage').is_symlink() and (self.root/'public/storage').resolve().is_relative_to(self.storage_anchor)
         self.configuration_source_changes={name for name in set(self.p['live_manifest']['files'])|set(self.p['candidate_manifest']['files'])if self.p['live_manifest']['files'].get(name)!=self.p['candidate_manifest']['files'].get(name)and(name.startswith(('config/','app/Providers/'))or name in['bootstrap/providers.php','bootstrap/app.php'])}
+        if self.configuration_source_changes and not self.p.get('config_change_hashes'):raise Refuse('explicit_typed_configuration_scope_required')
         if self.p.get('queue_adapter')=='native_redis'and(self.configuration_source_changes or self.p.get('config_change_hashes')):raise Refuse('redis_configuration_delta_requires_separate_review')
         self.check_untracked_runtime()
         self.report.update(status='PREFLIGHT_PASS',own_processes=len(self.worker_rows),worker_groups=len(self.p['worker_groups']),actual_runtime_root=str(self.root))

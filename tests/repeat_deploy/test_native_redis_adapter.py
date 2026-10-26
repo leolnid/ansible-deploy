@@ -1,11 +1,15 @@
 import importlib.util
 import json
+import os
 import pathlib
+import shutil
 import tempfile
 import unittest
 from unittest.mock import patch
 
 ROOT = pathlib.Path(__file__).resolve().parents[2]
+PHP = os.environ.get('REPEAT_DEPLOY_TEST_PHP') or shutil.which('php') or '/usr/bin/php8.5'
+FIXTURE_ROOT = pathlib.Path(os.environ.get('REPEAT_DEPLOY_TEST_ROOT', tempfile.gettempdir())).resolve()
 MIXIN = ROOT / 'roles/RepeatDeploy/files/s2_native_redis_queue_mixin.py'
 ADAPTER = ROOT / 'roles/RepeatDeploy/files/s2_native_redis_queue_adapter.php'
 spec = importlib.util.spec_from_file_location('native_redis_mixin', MIXIN)
@@ -17,7 +21,7 @@ class FakeRelease(module.NativeRedisQueueMixin):
     def __init__(self, root, cache, config):
         self.root = root
         self.queue_cache = cache
-        self.p = {'php_cli': r'C:\Development\_tools\php85\php.exe'}
+        self.p = {'php_cli': str(PHP)}
         self.uid = 33
         self.cfg = config
         self.calls = []
@@ -39,7 +43,7 @@ class FakeRelease(module.NativeRedisQueueMixin):
 
 class NativeRedisAdapterTests(unittest.TestCase):
     def setUp(self):
-        self.tmp = tempfile.TemporaryDirectory(prefix='redis-mixin-fixture-')
+        self.tmp = tempfile.TemporaryDirectory(prefix='redis-mixin-fixture-', dir=FIXTURE_ROOT)
         self.root = pathlib.Path(self.tmp.name)
         self.cache = self.root / 'config.php'
         self.cache.write_text('fixed synthetic config', encoding='ascii')
@@ -58,7 +62,7 @@ class NativeRedisAdapterTests(unittest.TestCase):
     def test_frozen_queue_scope_and_readonly_count_contract(self):
         app = FakeRelease(self.root, self.cache, self.config)
         app.bind_native_redis_adapter(self.adapter)
-        with patch('os.readlink', return_value=r'C:\Development\_tools\php85\php.exe'):
+        with patch('os.readlink', return_value=str(PHP)):
             rows, queues = app.workers()
         self.assertEqual(rows['fixture:1']['state'], 'RUNNING')
         self.assertEqual(queues, {'fixture-redis': ['backfill', 'main']})
@@ -76,7 +80,7 @@ class NativeRedisAdapterTests(unittest.TestCase):
     def test_cached_config_drift_refuses_before_counts(self):
         app = FakeRelease(self.root, self.cache, self.config)
         app.bind_native_redis_adapter(self.adapter)
-        with patch('os.readlink', return_value=r'C:\Development\_tools\php85\php.exe'):
+        with patch('os.readlink', return_value=str(PHP)):
             app.workers()
         self.cache.write_text('synthetic drift', encoding='ascii')
         with self.assertRaisesRegex(RuntimeError, '^cached_config_drift$'):
@@ -87,7 +91,7 @@ class NativeRedisAdapterTests(unittest.TestCase):
         config['database']['redis']['default']['url'] = 'redis://fake-user:fake-pass@invalid.example'
         app = FakeRelease(self.root, self.cache, config)
         app.bind_native_redis_adapter(self.adapter)
-        with patch('os.readlink', return_value=r'C:\Development\_tools\php85\php.exe'):
+        with patch('os.readlink', return_value=str(PHP)):
             with self.assertRaisesRegex(RuntimeError, '^unsupported_cached_redis_url$'):
                 app.workers()
         self.assertNotIn('fake-pass', str(app.calls))

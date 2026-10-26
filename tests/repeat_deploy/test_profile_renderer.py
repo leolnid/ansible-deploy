@@ -20,9 +20,12 @@ class ProfileRendererTests(unittest.TestCase):
         }
         self.manifest = {'candidate_commit': 'c' * 40, 'files': {'artisan': 'd' * 64}}
         self.artifact = {'candidate_commit': 'c' * 40, 'source_archive_sha256': 'e' * 64}
+        self.expected_commit = 'c' * 40
+        self.archive_sha256 = 'e' * 64
 
     def test_candidate_is_bound_to_the_current_git_artifact_and_reviewed_baseline(self):
-        profile, inventory = renderer.render(self.enrollment, self.manifest, self.artifact)
+        profile, inventory = renderer.render(self.enrollment, self.manifest, self.artifact,
+                                             self.expected_commit, self.archive_sha256)
         self.assertEqual(profile['repeat_deploy_profile']['live_manifest'], self.enrollment['profile']['live_manifest'])
         self.assertEqual(profile['repeat_deploy_profile']['candidate_manifest'], self.manifest)
         self.assertEqual(profile['repeat_deploy_profile']['source_archive_sha256'], 'e' * 64)
@@ -33,7 +36,8 @@ class ProfileRendererTests(unittest.TestCase):
     def test_old_live_manifest_cannot_be_reused_as_the_new_candidate(self):
         stale = dict(self.manifest, candidate_commit='b' * 40)
         with self.assertRaises(ValueError):
-            renderer.render(self.enrollment, stale, self.artifact)
+            renderer.render(self.enrollment, stale, self.artifact,
+                            self.expected_commit, self.archive_sha256)
 
     def test_candidate_or_archive_digest_in_enrollment_is_refused(self):
         for key, value in [('candidate_manifest', self.manifest),
@@ -41,19 +45,22 @@ class ProfileRendererTests(unittest.TestCase):
             enrollment = dict(self.enrollment)
             enrollment['profile'] = dict(self.enrollment['profile'], **{key: value})
             with self.assertRaises(ValueError):
-                renderer.render(enrollment, self.manifest, self.artifact)
+                renderer.render(enrollment, self.manifest, self.artifact,
+                                self.expected_commit, self.archive_sha256)
 
     def test_invalid_artifact_identity_is_refused(self):
         for artifact in [dict(self.artifact, candidate_commit='not-a-commit'),
                          dict(self.artifact, source_archive_sha256='x' * 64)]:
             with self.assertRaises(ValueError):
-                renderer.render(self.enrollment, self.manifest, artifact)
+                renderer.render(self.enrollment, self.manifest, artifact,
+                                self.expected_commit, self.archive_sha256)
 
     def test_existing_ssh_user_variable_is_validated_and_resolved_without_copying_key(self):
         enrollment = dict(self.enrollment)
         enrollment.pop('inventory_user')
         enrollment['inventory_user_env'] = 'SSH_USER'
         _, inventory = renderer.render(enrollment, self.manifest, self.artifact,
+                                       self.expected_commit, self.archive_sha256,
                                        {'SSH_USER': 'legacy-deployer', 'SSH_PRIVATE_KEY': 'synthetic-private-key'})
         host = inventory['all']['hosts']['selected-app']
         self.assertEqual(host['ansible_user'], 'legacy-deployer')
@@ -62,12 +69,22 @@ class ProfileRendererTests(unittest.TestCase):
     def test_user_and_key_variable_names_are_not_open_ended(self):
         enrollment = dict(self.enrollment, ssh_key_env='UNRELATED_SECRET')
         with self.assertRaises(ValueError):
-            renderer.render(enrollment, self.manifest, self.artifact)
+            renderer.render(enrollment, self.manifest, self.artifact,
+                            self.expected_commit, self.archive_sha256)
         enrollment = dict(self.enrollment)
         enrollment.pop('inventory_user')
         enrollment['inventory_user_env'] = 'UNRELATED_SECRET'
         with self.assertRaises(ValueError):
-            renderer.render(enrollment, self.manifest, self.artifact, {'UNRELATED_SECRET': 'tester'})
+            renderer.render(enrollment, self.manifest, self.artifact,
+                            self.expected_commit, self.archive_sha256, {'UNRELATED_SECRET': 'tester'})
+
+    def test_candidate_must_match_ci_commit_and_archive_bytes(self):
+        with self.assertRaisesRegex(ValueError, '^artifact_commit_mismatch$'):
+            renderer.render(self.enrollment, self.manifest, self.artifact,
+                            'f' * 40, self.archive_sha256)
+        with self.assertRaisesRegex(ValueError, '^artifact_archive_digest_mismatch$'):
+            renderer.render(self.enrollment, self.manifest, self.artifact,
+                            self.expected_commit, '0' * 64)
 
 
 def json_text(value):
