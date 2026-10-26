@@ -100,14 +100,14 @@ class ContractTests(unittest.TestCase):
     def setUp(self):
         self.tmp=tempfile.TemporaryDirectory(prefix='.repeat-package-test-',dir=FIXTURE_ROOT);self.base=pathlib.Path(self.tmp.name);self.live=self.base/'application';self.live.mkdir();(self.live/'app').mkdir();(self.live/'bootstrap/cache').mkdir(parents=True);(self.live/'storage/app').mkdir(parents=True);(self.live/'.env').write_bytes(b'SYNTHETIC_NOT_A_REAL_CREDENTIAL=fixture\n');(self.live/'.env').chmod(0o640);(self.live/'storage/app/customer-data.txt').write_bytes(b'synthetic-user-data');(self.live/'storage/app/customer-data.txt').chmod(0o664);(self.live/'bootstrap/cache/config.php').write_bytes(b'synthetic-old-cache');(self.live/'bootstrap/cache/config.php').chmod(0o640);(self.live/'vendor/composer').mkdir(parents=True);(self.live/'vendor/composer/autoload_real.php').write_text('<?php');(self.live/'vendor/composer/platform_check.php').write_text('<?php');(self.base/'nginx.conf').write_bytes(b'server { server_name fixture.example.invalid; }');(self.base/'supervisor.conf').write_bytes(b'synthetic-existing-topology')
         self.user_upload=self.live/'public/filemanager/uploads/416255.png'
-        self.old={'app/Marker.php':b'<?php // old\n','composer.json':b'{"require":{"php":"^8.5"}}\n','composer.lock':b'{"packages":[]}\n','bootstrap/app.php':b'<?php // synthetic bootstrap\n'}
+        self.old={'app/Marker.php':b'<?php // old\n','composer.json':b'{"require":{"php":"^8.5"}}\r\n','composer.lock':b'{"packages":[]}\r\n','bootstrap/app.php':b'<?php // synthetic bootstrap\n'}
         self.new={**self.old,'app/Marker.php':b'<?php // new\n'}
         for name,data in self.old.items():p=self.live/name;p.parent.mkdir(parents=True,exist_ok=True);p.write_bytes(data)
         self.archive=self.base/'source.tar.gz'
         with tarfile.open(self.archive,'w:gz') as t:
             for name,data in self.new.items():
-                data=data.replace(b'\n',b'\n');info=tarfile.TarInfo(name);info.size=len(data);info.mode=0o666;t.addfile(info,io.BytesIO(data))
-        manifest=lambda files,sha:{'candidate_commit':sha*40,'files':{n:h(v.replace(b'\n',b'\n')) for n,v in files.items()},'normalization_by_path':{n:'crlf_to_lf' for n in files}}
+                data=data.replace(b'\r\n',b'\n');info=tarfile.TarInfo(name);info.size=len(data);info.mode=0o666;t.addfile(info,io.BytesIO(data))
+        manifest=lambda files,sha:{'candidate_commit':sha*40,'files':{n:h(v.replace(b'\r\n',b'\n')) for n,v in files.items()},'normalization_by_path':{n:'crlf_to_lf' for n in files}}
         self.profile={'schema_version':1,'project':'fixture','application_root':str(self.live),'php_cli':'/usr/bin/php8.5','php_minor':'8.5','fpm_socket':'/run/php/php8.5-fpm.sock','nginx_config':'/etc/nginx/sites-enabled/fixture.conf','server_names':['fixture.example.invalid'],'public_baselines':{'fixture.example.invalid':{'80':200,'443':200}},'worker_groups':{'fixture':1},'supervisor_config_hashes':{'/etc/supervisor/conf.d/fixture.conf':'a'*64},'live_manifest':manifest(self.old,'a'),'candidate_manifest':manifest(self.new,'b'),'source_archive_sha256':m.digest(self.archive),'backup_reference':'synthetic-verified-backup','server_identity_sha256':'c'*64,'fpm_status_path':'/existing-status','fpm_pool':'fixture','minimum_free_bytes':0,'drain_timeout':.01,'start_timeout':.01}
     def tearDown(self):
         target=self.base.resolve();assert target.parent==FIXTURE_ROOT and target.name.startswith('.repeat-package-test-');self.tmp.cleanup()
