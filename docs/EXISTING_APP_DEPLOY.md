@@ -57,13 +57,16 @@ Composer classmaps. A separately reviewed vendor release is required for those.
 It does not run Composer, migrations, seeders, frontend builds, route/event
 cache commands, cache flushes, initial provisioning or external business calls.
 
-The final config cache is built only in a fresh private `APP_CONFIG_CACHE`
-path while the old default cache remains present. Effective configuration is
-strictly equal except explicit typed old/new digest deltas at reviewed existing
-paths, or explicitly allowed path values resolving to the same data inode.
-Credentials, DB/queue/cache/session settings and coordination/concurrency are
-never delta allowlisted. Unknown app providers can execute code during boot:
-review those providers before enrolling an application.
+When no configuration source or typed delta changes, the existing default
+config cache is preserved byte-for-byte with its mode and ownership. For a
+configuration-source change, bootstrap uses distinct temporary cache paths
+and a private, per-run `LARAVEL_STORAGE_PATH` tree. If the effective native
+configuration is unchanged, the old cache remains exact. Otherwise only
+explicitly reviewed typed config nodes are promoted into a copy of the old
+cache; every other old node must remain equal in PHP type and value. Credentials,
+DB/queue/cache/session settings and coordination/concurrency are never delta
+allowlisted. Unknown app providers can execute code during boot: review those
+providers before enrolling an application.
 
 ## Cutover and recovery
 
@@ -95,11 +98,14 @@ claim customer acceptance of business workflows.
 
 ## Supported connections and status enrollment
 
-This v1 supports native `queue:work` on existing MySQL database queues only.
-Redis, DB URLs, Unix sockets, prefixed tables, replicas and nonempty PDO options
-are refused before mutation. A future Redis adapter needs its own reservation,
-drain and recovery review; this package does not claim all 26 CI pipelines are
-already adopted.
+The default queue adapter supports native `queue:work` on existing MySQL
+database queues. An explicit `queue_adapter: native_redis` profile enables the
+separate bounded adapter only for the reviewed Contact default/backfill and
+Salesbots default topologies. It freezes the Laravel-resolved Redis
+host/port/database/prefix tuple before applying a cutover and counts only with
+native `LLEN`/`ZCARD`; it never reads queue payloads. Other Redis apps, DB URLs,
+Unix sockets, prefixed SQL tables, replicas and nonempty PDO options are
+refused before mutation.
 
 The reviewed profile must specify `fpm_pool`, `fpm_status_path` and the existing
 `fpm_status_socket` under a root-owned 0700 parent. It is a private FastCGI status
@@ -121,4 +127,22 @@ content and records the pinned common commit and LFS object metadata.
 
 A standalone Supervisor selector is accepted only by its exact configured
 name when the reviewed group expects exactly one process. Multi-process groups
-still require their exact `group:process` selectors. Redis remains unsupported.
+still require their exact `group:process` selectors.
+
+## CI adoption
+
+The reusable include lives at `.gitlab/ci/repeat-existing-app.yml`. An
+application adopts it only after review by pinning that include URL and
+`REPEAT_DEPLOY_PACKAGE_REF` to the same 40-character package commit. Its
+`.deploy/runtime-profile.json` stores only the reviewed server enrollment and
+old-live baseline; the build job creates a new candidate manifest and archive
+from `CI_COMMIT_SHA` and that application's exact Common Gitlink. The
+candidate is never copied into the enrollment file. The builder excludes the
+entire `.deploy/` tree from the production archive.
+
+Artifact creation runs as a non-deploying job. On the default branch, a manual
+read-only preflight must complete before the separate manual apply becomes
+available. SSH host verification is strict and uses the committed
+`.deploy/known_hosts`; no runtime key scan or disabled host checking is used.
+Legacy provisioning/setup jobs remain separate and are not invoked by this
+include. A refusal has no automatic legacy fallback.

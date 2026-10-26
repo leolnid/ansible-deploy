@@ -6,10 +6,18 @@ cache flush or topology generation is part of this executor.
 """
 from __future__ import annotations
 import argparse, copy, datetime, fcntl, hashlib, json, os, pathlib, re, secrets
-import shutil, signal, stat, subprocess, sys, tarfile, time, pwd
+import shutil, signal, stat, subprocess, sys, tarfile, time, pwd, importlib.util
 
 class Refuse(RuntimeError):
     pass
+
+def pinned_module(name,filename,expected):
+    path=pathlib.Path(__file__).with_name(filename)
+    if path.is_symlink()or hashlib.sha256(path.read_bytes()).hexdigest()!=expected:raise Refuse('pinned_runtime_module_drift')
+    spec=importlib.util.spec_from_file_location(name,path);module=importlib.util.module_from_spec(spec);spec.loader.exec_module(module);return module
+
+NATIVE_CONFIG_SHA='c7418a4ce94ea696993ec84575c754fddaf4119f057be3a24129664f41a7cd7f'
+_native_config=pinned_module('repeat_native_configuration','native_configuration.py',NATIVE_CONFIG_SHA)
 
 def sha(data):
     return hashlib.sha256(data).hexdigest()
@@ -101,9 +109,10 @@ def validate_profile(p):
             raise Refuse('invalid_bounded_timeout')
     if type(p.get('minimum_free_bytes',1024**3)) is not int or p.get('minimum_free_bytes',1024**3) < 0:
         raise Refuse('invalid_free_space_reserve')
-    allowed = set(required) | {'schema_version','cron_user','preserve_copy_paths','preserve_link_paths','same_inode_config_paths','drain_timeout','start_timeout','minimum_free_bytes','config_change_hashes','fpm_status_path','fpm_pool','fpm_status_socket'}
+    allowed = set(required) | {'schema_version','cron_user','preserve_copy_paths','preserve_link_paths','same_inode_config_paths','drain_timeout','start_timeout','minimum_free_bytes','config_change_hashes','fpm_status_path','fpm_pool','fpm_status_socket','queue_adapter'}
     if set(p) - allowed:
         raise Refuse('unknown_profile_field')
+    if p.get('queue_adapter','database')not in ['database','native_redis']:raise Refuse('unsupported_explicit_queue_adapter')
     forbidden = ['run_migrations', 'run_seeders', 'build_assets', 'manage_supervisor', 'manage_cron', 'update_env', 'flush_live_cache', 'setup_server']
     if any(p.get(k) for k in forbidden):
         raise Refuse('provisioning_or_business_mutation_not_supported')
@@ -606,6 +615,8 @@ class ExistingRelease:
         self.env_hash = digest(self.env_anchor)
         self.old_cache = self.queue_cache.read_bytes()
         self.standard_public_storage = (self.root/'public/storage').is_symlink() and (self.root/'public/storage').resolve().is_relative_to(self.storage_anchor)
+        self.configuration_source_changes={name for name in set(self.p['live_manifest']['files'])|set(self.p['candidate_manifest']['files'])if self.p['live_manifest']['files'].get(name)!=self.p['candidate_manifest']['files'].get(name)and(name.startswith(('config/','app/Providers/'))or name in['bootstrap/providers.php','bootstrap/app.php'])}
+        if self.p.get('queue_adapter')=='native_redis'and(self.configuration_source_changes or self.p.get('config_change_hashes')):raise Refuse('redis_configuration_delta_requires_separate_review')
         self.check_untracked_runtime()
         self.report.update(status='PREFLIGHT_PASS',own_processes=len(self.worker_rows),worker_groups=len(self.p['worker_groups']),actual_runtime_root=str(self.root))
         return self.report
@@ -763,34 +774,39 @@ class ExistingRelease:
         return False
 
     def build_config(self):
-        self.phase = 'protected_final_config'
-        cache = self.root / 'bootstrap/cache/config.php'
-        temp = cache.with_name('.repeat-config-' + secrets.token_hex(8) + '.php')
-        self.temp_cache = temp
-        private_paths={
-            'APP_CONFIG_CACHE':temp,
-            'APP_SERVICES_CACHE':cache.with_name('.repeat-services-'+secrets.token_hex(8)+'.php'),
-            'APP_PACKAGES_CACHE':cache.with_name('.repeat-packages-'+secrets.token_hex(8)+'.php'),
-            'APP_EVENTS_CACHE':cache.with_name('.repeat-events-'+secrets.token_hex(8)+'.php'),
-            'APP_ROUTES_CACHE':cache.with_name('.repeat-routes-'+secrets.token_hex(8)+'.php'),
-        }
-        prefix = ['unshare','--net','sudo','-u','#'+str(self.uid),'env',*[key+'='+str(value) for key,value in private_paths.items()],self.p['php_cli']]
-        probe = "require $argv[1].'/vendor/autoload.php';$a=require $argv[1].'/bootstrap/app.php';echo $a->getCachedConfigPath();"
-        paths_probe="require $argv[1].'/vendor/autoload.php';$a=require $argv[1].'/bootstrap/app.php';echo json_encode([$a->getCachedConfigPath(),$a->getCachedServicesPath(),$a->getCachedPackagesPath(),$a->getCachedEventsPath(),$a->getCachedRoutesPath()]);"
-        if json.loads(self.run(prefix + ['-r',paths_probe,str(self.root)])) != [str(value) for value in private_paths.values()]:
-            raise Refuse('actual_temp_config_path_mismatch')
-        # No active cache is cleared: Laravel sees only this fresh private path.
-        self.run(prefix + ['artisan','config:cache','--quiet'], cwd=self.root, umask=0o077)
-        if not cache.is_file() or cache.read_bytes() != self.old_cache:
-            raise Refuse('default_cache_changed_before_validated_promotion')
-        temp.chmod(0o600)
-        os.chown(temp,self.uid,self.gid)
-        fresh = json.loads(self.php('$c=require $argv[1];echo json_encode($c,JSON_THROW_ON_ERROR);',[temp]))
-        if not self.config_equal(self.cfg, fresh):
-            raise Refuse('unreviewed_effective_configuration_change')
-        temp.chmod(0o640)
-        os.replace(temp,cache)
-        self.temp_cache = None
+        self.phase='protected_final_config'
+        cache=self.root/'bootstrap/cache/config.php'
+        if not self.configuration_source_changes and not self.p.get('config_change_hashes'):
+            if cache.read_bytes()!=self.old_cache or stat.S_IMODE(cache.stat().st_mode)!=0o640 or(cache.stat().st_uid,cache.stat().st_gid)!=(self.uid,self.gid):raise Refuse('preserved_configuration_drift')
+            self.report['configuration_strategy']='preserved_exact_existing_config'
+            return
+        temp=cache.with_name('.repeat-config-'+secrets.token_hex(8)+'.php');self.temp_cache=temp
+        private={key:cache.with_name('.repeat-'+kind+'-'+secrets.token_hex(8)+'.php')for key,kind in [('APP_CONFIG_CACHE','config'),('APP_SERVICES_CACHE','services'),('APP_PACKAGES_CACHE','packages'),('APP_EVENTS_CACHE','events'),('APP_ROUTES_CACHE','routes')]};private['APP_CONFIG_CACHE']=temp
+        storage=cache.parent/('.repeat-private-storage-'+secrets.token_hex(8));storage.mkdir(mode=0o700);os.chown(storage,self.uid,self.gid)
+        for name in ['framework','framework/cache','framework/cache/data','framework/views','framework/sessions','logs','app']:
+            folder=storage/name;folder.mkdir(mode=0o700,exist_ok=True);os.chown(folder,self.uid,self.gid)
+        self.report['private_bootstrap_storage_retained']=str(storage)
+        prefix=['unshare','--net','setpriv','--reuid='+str(self.uid),'--regid='+str(self.gid),'--init-groups','env','LARAVEL_STORAGE_PATH='+str(storage),*[k+'='+str(v)for k,v in private.items()],self.p['php_cli']]
+        probe="require $argv[1].'/vendor/autoload.php';$a=require $argv[1].'/bootstrap/app.php';echo json_encode([$a->getCachedConfigPath(),$a->getCachedServicesPath(),$a->getCachedPackagesPath(),$a->getCachedEventsPath(),$a->getCachedRoutesPath(),$a->storagePath()]);"
+        try:
+            if json.loads(self.run(prefix+['-r',probe,str(self.root)]))!=[str(v)for v in private.values()]+[str(storage)]:raise Refuse('private_cache_and_storage_paths_required')
+            self.run(prefix+['artisan','config:cache','--quiet'],cwd=self.root,umask=0o077)
+            if cache.read_bytes()!=self.old_cache:raise Refuse('default_cache_changed_before_validated_promotion')
+            temp.chmod(0o600)
+            allowed=self.p.get('config_change_hashes',{})
+            if allowed:
+                _native_config.merge_native_config_nodes(self,cache,temp,allowed)
+            if not _native_config.native_config_proof(self,cache,temp,allowed):raise Refuse('unreviewed_native_effective_configuration_change')
+            if not allowed:
+                temp.unlink();self.temp_cache=None
+                self.report['configuration_strategy']='private_bootstrap_exact_effective_config_preserved'
+                return
+            os.chown(temp,self.uid,self.gid);temp.chmod(0o640);now=int(time.time());now+=int(now==int(cache.stat().st_mtime));os.utime(temp,(now,now));os.replace(temp,cache);self.temp_cache=None
+            self.report['configuration_strategy']='native_reviewed_nodes_only_private_storage'
+        except _native_config.ConfigurationRefuse as error:raise Refuse(str(error))from error
+        finally:
+            for path in private.values():
+                if path.exists():path.unlink()
 
     def cutover(self):
         self.phase = 'fresh_live_guards'
@@ -925,6 +941,21 @@ class ExistingRelease:
                     self.checkpoint()
                 raise
 
+def release_for(profile,archive):
+    release=ExistingRelease(profile,archive)
+    if profile.get('queue_adapter','database')=='database':return release
+    if profile['project']not in['contact-channel','salesbots']:raise Refuse('redis_project_not_allowlisted')
+    module=pinned_module('repeat_native_redis','s2_native_redis_queue_mixin.py','d1c0ff39e2ddcc19a36e5eb00737bc1d6a4bd88a1449187a4b40d066d6597a4f')
+    adapter=pathlib.Path(__file__).with_name('s2_native_redis_queue_adapter.php');raw=adapter.read_bytes()
+    if adapter.is_symlink()or sha(raw)!='ac2332daf66355ba84c286f5ad59cbef23ee1d105d2611ca1f4974f66a383414':raise Refuse('pinned_native_redis_adapter_drift')
+    class RedisRelease(module.NativeRedisQueueMixin,ExistingRelease):
+        NativeQueueRefuse=Refuse
+        def validate_queue_connections(self):
+            module.NativeRedisQueueMixin.validate_queue_connections(self)
+            queues,count={'contact-channel':({'default','backfill'},2),'salesbots':({'default'},1)}[self.p['project']]
+            if{q for selected in self.queue_specs.values()for q in selected}!=queues or len(self.worker_rows)!=count:raise Refuse('redis_owned_topology_drift')
+    release.__class__=RedisRelease;release.bind_native_redis_adapter(raw.decode('utf-8'));return release
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--profile',required=True)
@@ -938,7 +969,7 @@ def main(argv=None):
         signal.signal(sig,cancelled)
     try:
         profile = json.loads(pathlib.Path(args.profile).read_text())
-        release = ExistingRelease(profile,args.archive)
+        release = release_for(profile,args.archive)
         print(json.dumps(release.execute(args.apply)))
         return 0
     except BaseException as exc:

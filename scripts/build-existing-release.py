@@ -47,7 +47,7 @@ def build(repo, revision, destination, common_checkout=None):
             if kind!='blob' or mode not in ['100644','100755']:raise ValueError('unsupported_git_entry')
             if materialized:
                 if not(name.startswith(('src/','config/','routes/','resources/'))or name=='composer.json'):continue
-            elif parts[0]in['storage','vendor']or name.startswith('bootstrap/cache/'):continue
+            elif parts[0]in['storage','vendor','.deploy']or name.startswith('bootstrap/cache/'):continue
             data,metadata=lfs_payload(checkout,name,git(checkout,'cat-file','blob',oid))
             if target in files:raise ValueError('duplicate_materialized_source_path')
             files[target]=hashlib.sha256(data).hexdigest();modes[target]=0o755 if mode=='100755'else 0o644;blobs[target]=data

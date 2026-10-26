@@ -1,0 +1,87 @@
+# Reusable, opt-in existing-application delivery. Callers pin this file and the
+# package checkout to the same immutable ansible-deploy commit.
+.repeat-deploy-package:
+  image: willhallonline/ansible:latest
+  variables:
+    GIT_SUBMODULE_STRATEGY: none
+  before_script: []
+  rules:
+    - if: '$REPEAT_DEPLOY_PACKAGE_REF =~ /^[0-9a-f]{40}$/ && $CI_COMMIT_SHA'
+
+repeat-deploy:artifact:
+  extends: .repeat-deploy-package
+  stage: deploy
+  before_script:
+    - test -f .deploy/runtime-profile.json
+    - test -f .deploy/known_hosts
+    - git submodule update --init --depth 1 packages/leolnid/common
+    - git clone --no-checkout https://github.com/leolnid/ansible-deploy.git .repeat-deploy-package
+    - git -C .repeat-deploy-package fetch --depth 1 origin "$REPEAT_DEPLOY_PACKAGE_REF"
+    - git -C .repeat-deploy-package checkout --detach "$REPEAT_DEPLOY_PACKAGE_REF"
+    - test "$(git -C .repeat-deploy-package rev-parse HEAD)" = "$REPEAT_DEPLOY_PACKAGE_REF"
+  script:
+    - python3 .repeat-deploy-package/scripts/build-existing-release.py --repo "$CI_PROJECT_DIR" --commit "$CI_COMMIT_SHA" --output release --common-checkout "$CI_PROJECT_DIR/packages/leolnid/common"
+  artifacts:
+    paths:
+      - release/
+    expire_in: 7 days
+
+.repeat-deploy-run:
+  extends: .repeat-deploy-package
+  stage: deploy
+  needs:
+    - job: repeat-deploy:artifact
+      artifacts: true
+  before_script:
+    - test -f .deploy/runtime-profile.json
+    - test -f .deploy/known_hosts
+    - git submodule update --init --depth 1 packages/leolnid/common
+    - git clone --no-checkout https://github.com/leolnid/ansible-deploy.git .repeat-deploy-package
+    - git -C .repeat-deploy-package fetch --depth 1 origin "$REPEAT_DEPLOY_PACKAGE_REF"
+    - git -C .repeat-deploy-package checkout --detach "$REPEAT_DEPLOY_PACKAGE_REF"
+    - test "$(git -C .repeat-deploy-package rev-parse HEAD)" = "$REPEAT_DEPLOY_PACKAGE_REF"
+    - set +x
+    - eval "$(ssh-agent -s)"
+    - trap 'ssh-agent -k >/dev/null 2>&1 || true' EXIT
+    - python3 -c 'import json;print(json.load(open(".deploy/runtime-profile.json")).get("ssh_key_env","ANSIBLE_SSH_PRIVATE_KEY"))' > .repeat-deploy-key-env
+    - read -r REPEAT_DEPLOY_KEY_ENV < .repeat-deploy-key-env
+    - rm -f .repeat-deploy-key-env
+    - |
+      case "$REPEAT_DEPLOY_KEY_ENV" in
+        ANSIBLE_SSH_PRIVATE_KEY) test -n "${ANSIBLE_SSH_PRIVATE_KEY:-}"; printf '%s\n' "$ANSIBLE_SSH_PRIVATE_KEY" | ssh-add - >/dev/null ;;
+        SSH_PRIVATE_KEY) test -n "${SSH_PRIVATE_KEY:-}"; printf '%s\n' "$SSH_PRIVATE_KEY" | ssh-add - >/dev/null ;;
+        *) echo 'Unsupported reviewed SSH key variable name' >&2; exit 1 ;;
+      esac
+    - python3 -c 'import json;print(json.load(open(".deploy/runtime-profile.json"))["inventory_host"])' > .repeat-deploy-host
+    - read -r REPEAT_DEPLOY_HOST < .repeat-deploy-host
+    - rm -f .repeat-deploy-host
+    - ssh-keygen -F "$REPEAT_DEPLOY_HOST" -f "$CI_PROJECT_DIR/.deploy/known_hosts" >/dev/null
+    - export ANSIBLE_HOST_KEY_CHECKING=True
+    - export ANSIBLE_SSH_ARGS="-o StrictHostKeyChecking=yes -o UserKnownHostsFile=$CI_PROJECT_DIR/.deploy/known_hosts"
+    - python3 .repeat-deploy-package/scripts/render-repeat-profile.py --enrollment .deploy/runtime-profile.json --artifact-directory release --output-directory release/target
+repeat-deploy:preflight:
+  extends: .repeat-deploy-run
+  rules:
+    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH && $REPEAT_DEPLOY_PACKAGE_REF =~ /^[0-9a-f]{40}$/ && $CI_COMMIT_SHA'
+  when: manual
+  allow_failure: false
+  script:
+    - ansible-playbook --inventory release/target/inventory.json --limit selected-app .repeat-deploy-package/repeat-deploy.yml -e @release/target/profile.json -e "repeat_deploy_source_archive=$CI_PROJECT_DIR/release/source.tar.gz"
+  artifacts:
+    paths:
+      - release/
+    expire_in: 7 days
+
+repeat-deploy:apply:
+  extends: .repeat-deploy-run
+  needs:
+    - job: repeat-deploy:preflight
+      artifacts: true
+  when: manual
+  rules:
+    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH && $REPEAT_DEPLOY_PACKAGE_REF =~ /^[0-9a-f]{40}$/ && $CI_COMMIT_SHA'
+  allow_failure: false
+  environment:
+    name: production
+  script:
+    - ansible-playbook --inventory release/target/inventory.json --limit selected-app .repeat-deploy-package/repeat-deploy.yml -e @release/target/profile.json -e "repeat_deploy_source_archive=$CI_PROJECT_DIR/release/source.tar.gz" -e repeat_deploy_apply=true

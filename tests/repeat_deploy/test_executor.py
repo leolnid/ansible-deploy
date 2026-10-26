@@ -15,7 +15,7 @@ class SandboxRelease(m.ExistingRelease):
         self.fresh_cfg=copy.deepcopy(self.fake_cfg)
         if failure=='config':self.fresh_cfg['queue']['default']='unreviewed'
     def preflight(self):
-        self.manifest(self.root,self.p['live_manifest']);self.cfg=copy.deepcopy(self.fake_cfg);self.queue_cache=self.root/'bootstrap/cache/config.php';self.old_cache=self.queue_cache.read_bytes();self.uid=os.getuid();self.gid=os.getgid();self.env_anchor=(self.root/'.env').resolve();self.storage_anchor=(self.root/'storage').resolve();self.env_hash=m.digest(self.env_anchor);self.anchor_inodes={'env':self.env_anchor.stat().st_ino,'storage':self.storage_anchor.stat().st_ino};self.worker_rows,self.queue_specs=self.workers();self.nginx_path=self.base/'nginx.conf';self.nginx_before=self.nginx_path.read_bytes();self.nginx_stat=self.nginx_path.stat();self.nginx_gate=self.nginx_before+b'\nreturn 503;\n';self.cron_before=self.cron_current;self.cron_paused_content=b'# own deployment pause\n';self.supervisor_hashes={str(self.base/'supervisor.conf'):m.digest(self.base/'supervisor.conf')};self.standard_public_storage=False;self.check_untracked_runtime();self.report['status']='PREFLIGHT_PASS';return self.report
+        self.manifest(self.root,self.p['live_manifest']);self.cfg=copy.deepcopy(self.fake_cfg);self.queue_cache=self.root/'bootstrap/cache/config.php';self.old_cache=self.queue_cache.read_bytes();self.uid=os.getuid();self.gid=os.getgid();self.env_anchor=(self.root/'.env').resolve();self.storage_anchor=(self.root/'storage').resolve();self.env_hash=m.digest(self.env_anchor);self.anchor_inodes={'env':self.env_anchor.stat().st_ino,'storage':self.storage_anchor.stat().st_ino};self.worker_rows,self.queue_specs=self.workers();self.nginx_path=self.base/'nginx.conf';self.nginx_before=self.nginx_path.read_bytes();self.nginx_stat=self.nginx_path.stat();self.nginx_gate=self.nginx_before+b'\nreturn 503;\n';self.cron_before=self.cron_current;self.cron_paused_content=b'# own deployment pause\n';self.supervisor_hashes={str(self.base/'supervisor.conf'):m.digest(self.base/'supervisor.conf')};self.standard_public_storage=False;self.check_untracked_runtime();self.configuration_source_changes={name for name in set(self.p['live_manifest']['files'])|set(self.p['candidate_manifest']['files'])if self.p['live_manifest']['files'].get(name)!=self.p['candidate_manifest']['files'].get(name)and(name.startswith(('config/','app/Providers/'))or name in['bootstrap/providers.php','bootstrap/app.php'])};self.report['status']='PREFLIGHT_PASS';return self.report
     def state_path(self):return pathlib.Path(self.state_temp.name)/'state/current.json'
     def workers(self):return copy.deepcopy(self.states),{'database':['default','backfill']}
     def statuses(self):return copy.deepcopy(self.states)
@@ -50,6 +50,9 @@ class SandboxRelease(m.ExistingRelease):
             if any('getCachedConfigPath' in x for x in args):return json.dumps([x.partition('=')[2] for x in args if x.startswith(('APP_CONFIG_CACHE=','APP_SERVICES_CACHE=','APP_PACKAGES_CACHE=','APP_EVENTS_CACHE=','APP_ROUTES_CACHE='))]).encode()
             if 'config:cache' in args:pathlib.Path(target).write_bytes(b'synthetic-new-cache');return b''
         return b''
+    def build_config(self):
+        if self.failure=='config':raise m.Refuse('simulated_unreviewed_configuration_change')
+        return super().build_config()
     def start(self):
         if self.failure=='start' and not self.failed_start_once:
             name=next(iter(self.states));self.run(['supervisorctl','start',name]);raise m.Refuse('simulated_start_backoff')
@@ -153,6 +156,12 @@ class ContractTests(unittest.TestCase):
         r=self.release(failure='config')
         with self.assertRaises(m.Refuse):self.apply(r)
         self.assert_original(r);self.assertEqual((self.live/'bootstrap/cache/config.php').read_bytes(),b'synthetic-old-cache')
+    def test_no_configuration_source_delta_preserves_existing_cache_exactly(self):
+        r=self.release();r.preflight();cache=r.root/'bootstrap/cache/config.php';before=(cache.read_bytes(),cache.stat().st_mode,cache.stat().st_uid,cache.stat().st_gid);events=list(r.events)
+        r.build_config()
+        after=cache.stat()
+        self.assertEqual(cache.read_bytes(),before[0]);self.assertEqual(after.st_mode,before[1]);self.assertEqual((after.st_uid,after.st_gid),before[2:]);self.assertEqual(r.events,events)
+        self.assertEqual(r.report['configuration_strategy'],'preserved_exact_existing_config')
     def test_backoff_is_stopped_explicitly_before_rollback(self):
         r=self.release(failure='start')
         with self.assertRaises(m.Refuse):self.apply(r)

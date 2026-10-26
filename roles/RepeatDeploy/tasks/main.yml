@@ -30,6 +30,16 @@
     dest: "{{ repeat_deploy_control.path }}/repeat_deploy.py"
     mode: '0600'
 
+- name: Upload pinned native configuration and Redis modules
+  ansible.builtin.copy:
+    src: "{{ item }}"
+    dest: "{{ repeat_deploy_control.path }}/{{ item }}"
+    mode: '0600'
+  loop:
+    - native_configuration.py
+    - s2_native_redis_queue_mixin.py
+    - s2_native_redis_queue_adapter.php
+
 - name: Upload the secret-free runtime profile
   ansible.builtin.copy:
     content: "{{ repeat_deploy_profile | to_json }}"
