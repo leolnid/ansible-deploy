@@ -5,13 +5,13 @@ FIXTURE_ROOT=pathlib.Path(os.environ.get('REPEAT_DEPLOY_TEST_ROOT',tempfile.gett
 class BuilderTests(unittest.TestCase):
  def setUp(self):
   self.tmp=tempfile.TemporaryDirectory(prefix='repeat-builder-',dir=FIXTURE_ROOT);self.base=pathlib.Path(self.tmp.name).resolve();assert self.base.parent==FIXTURE_ROOT and self.base.name.startswith('repeat-builder-');self.addCleanup(self.safe_cleanup);self.repo=self.base/'app';self.repo.mkdir();self.git(self.repo,'init','-q')
-  for name,content in {'artisan':b'<?php','bootstrap/app.php':b'<?php','composer.json':b'{}','composer.lock':b'{}','.deploy/runtime-profile.json':b'{"fixture":true}','.deploy/known_hosts':b'fixture public host key','packages/leolnid/common-deploy/deploy.yml':b'fixture provisioning metadata'}.items():p=self.repo/name;p.parent.mkdir(parents=True,exist_ok=True);p.write_bytes(content)
+  for name,content in {'artisan':b'<?php','bootstrap/app.php':b'<?php','composer.json':b'{}','composer.lock':b'{}','.deploy/runtime-profile.json':b'{"fixture":true}','.deploy/known_hosts':b'fixture public host key','packages/leolnid/common-deploy/deploy.yml':b'fixture provisioning metadata','public/index.php':b'<?php // public entry point','public/filemanager/uploads/416255.png':b'customer-owned-upload'}.items():p=self.repo/name;p.parent.mkdir(parents=True,exist_ok=True);p.write_bytes(content)
  def safe_cleanup(self):
   target=pathlib.Path(self.tmp.name).resolve();assert target==self.base and target.parent==FIXTURE_ROOT and target.name.startswith('repeat-builder-');self.tmp.cleanup()
  def git(self,repo,*args):return subprocess.check_output(['git','-C',str(repo),*args],stderr=subprocess.PIPE).decode().strip()
  def commit(self,repo):self.git(repo,'add','-A');self.git(repo,'-c','user.name=Fixture','-c','user.email=fixture@local.invalid','commit','-qm','synthetic fixture');return self.git(repo,'rev-parse','HEAD')
  def lfs(self):
-  self.data=b'\x00\xffsynthetic binary asset\x10';self.oid=hashlib.sha256(self.data).hexdigest();p=self.repo/'public/asset.bin';p.parent.mkdir();p.write_text('version https://git-lfs.github.com/spec/v1\noid sha256:'+self.oid+'\nsize '+str(len(self.data))+'\n');return self.commit(self.repo)
+  self.data=b'\x00\xffsynthetic binary asset\x10';self.oid=hashlib.sha256(self.data).hexdigest();p=self.repo/'public/asset.bin';p.parent.mkdir(exist_ok=True);p.write_text('version https://git-lfs.github.com/spec/v1\noid sha256:'+self.oid+'\nsize '+str(len(self.data))+'\n');return self.commit(self.repo)
  def object(self,data):
   p=self.repo/'.git/lfs/objects'/self.oid[:2]/self.oid[2:4]/self.oid;p.parent.mkdir(parents=True,exist_ok=True);p.write_bytes(data);return p
  def payload(self,output,name):
@@ -36,6 +36,11 @@ class BuilderTests(unittest.TestCase):
   with self.assertRaises(ValueError):m.build(self.repo,sha,self.base/'unused',self.repo)
   self.git(self.repo,'update-index','--add','--cacheinfo','120000,'+self.git(self.repo,'hash-object','artisan')+',public/link');self.git(self.repo,'-c','user.name=Fixture','-c','user.email=fixture@local.invalid','commit','-qm','unsupported symlink')
   with self.assertRaises(ValueError):m.build(self.repo,'HEAD',self.base/'symlink')
+ def test_customer_managed_public_uploads_never_enter_release_archive(self):
+  sha=self.commit(self.repo);out=self.base/'without-customer-uploads';m.build(self.repo,sha,out);manifest=json.loads((out/'manifest.json').read_text())
+  self.assertIn('public/index.php',manifest['files']);self.assertNotIn('public/filemanager/uploads/416255.png',manifest['files'])
+  with tarfile.open(out/'source.tar.gz')as archive:
+   names=archive.getnames();self.assertIn('public/index.php',names);self.assertNotIn('public/filemanager/uploads/416255.png',names)
  def test_ci_enrollment_files_never_enter_the_production_release_archive(self):
   sha=self.commit(self.repo);out=self.base/'without-ci-enrollment';receipt=m.build(self.repo,sha,out);manifest=json.loads((out/'manifest.json').read_text())
   self.assertNotIn('.deploy/runtime-profile.json',manifest['files']);self.assertNotIn('.deploy/known_hosts',manifest['files'])

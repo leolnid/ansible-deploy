@@ -26,7 +26,7 @@ def digest(path):
     return sha(pathlib.Path(path).read_bytes())
 
 def path_value(value):
-    if not isinstance(value, str) or not value.startswith('/') or any(c in value for c in '\n\r\0'):
+    if not isinstance(value, str) or not value.startswith('/') or any(c in value for c in '\n\n\0'):
         raise Refuse('invalid_absolute_path')
     p = pathlib.Path(value)
     if '..' in p.parts or p == pathlib.Path('/'):
@@ -322,14 +322,72 @@ class ExistingRelease:
 
     def manifest(self, root, manifest):
         for rel, expected in manifest['files'].items():
+            if self.user_managed_path(rel):
+                continue
             path = root / source_path(rel)
             if not path.is_file():
                 raise Refuse('missing_manifest_file')
             data = path.read_bytes()
             if manifest.get('normalization_by_path', {}).get(rel) == 'crlf_to_lf':
-                data = data.replace(b'\r\n', b'\n')
+                data = data.replace(b'\n', b'\n')
             if sha(data) != expected:
                 raise Refuse('source_manifest_drift')
+
+    @staticmethod
+    def user_managed_path(rel):
+        prefix = 'public/filemanager/uploads'
+        return rel == prefix or rel.startswith(prefix + '/')
+
+    def effective_preserve_copy_paths(self):
+        paths = list(self.p.get('preserve_copy_paths', []))
+        uploads = self.root / 'public/filemanager/uploads'
+        if uploads.is_symlink():
+            if 'public/filemanager/uploads' not in self.p.get('preserve_link_paths', []):
+                raise Refuse('customer_upload_directory_symlink_requires_explicit_profile')
+        if uploads.exists():
+            if uploads.is_symlink():
+                pass
+            elif not uploads.is_dir():
+                raise Refuse('customer_upload_directory_type_unsupported')
+            elif 'public/filemanager/uploads' not in paths:
+                paths.append('public/filemanager/uploads')
+        return paths
+
+    def user_managed_tree_fingerprint(self, root):
+        root = pathlib.Path(root)
+        result = {}
+        def visit(path, relative):
+            info = path.lstat()
+            metadata = [info.st_uid, info.st_gid, stat.S_IMODE(info.st_mode), info.st_mtime_ns]
+            if path.is_symlink():
+                result[relative] = ['symlink', os.readlink(path), metadata]
+            elif path.is_dir():
+                result[relative] = ['directory', metadata]
+                for child in sorted(path.iterdir()):
+                    visit(child, relative + '/' + child.name)
+            elif path.is_file():
+                result[relative] = ['file', digest(path), metadata]
+            else:
+                raise Refuse('unsupported_customer_upload_artifact_type')
+        visit(root, '.')
+        return result
+
+    def current_user_managed_uploads_fingerprint(self):
+        uploads = self.root/'public/filemanager/uploads'
+        if not uploads.exists() and not uploads.is_symlink():
+            return None
+        return self.user_managed_tree_fingerprint(uploads)
+
+    def preserve_user_managed_metadata(self, source, destination):
+        source, destination = pathlib.Path(source), pathlib.Path(destination)
+        if source.is_dir() and not source.is_symlink():
+            for child in source.iterdir():
+                self.preserve_user_managed_metadata(child, destination/child.name)
+        info = source.lstat()
+        os.chown(destination, info.st_uid, info.st_gid, follow_symlinks=False)
+        if not source.is_symlink():
+            destination.chmod(stat.S_IMODE(info.st_mode))
+        os.utime(destination, ns=(info.st_atime_ns, info.st_mtime_ns), follow_symlinks=False)
 
     def statuses(self):
         rows = {}
@@ -470,7 +528,7 @@ class ExistingRelease:
                'REQUEST_METHOD':'GET','QUERY_STRING':'full&json','REQUEST_URI':path+'?full&json',
                'SERVER_PROTOCOL':'HTTP/1.1','GATEWAY_INTERFACE':'CGI/1.1','CONTENT_LENGTH':'0'}
         raw = self.run(['cgi-fcgi','-bind','-connect',str(socket)],env=env)
-        body = re.split(rb'\r?\n\r?\n',raw,maxsplit=1)
+        body = re.split(rb'\n?\n\n?\n',raw,maxsplit=1)
         if len(body)!=2:
             raise Refuse('invalid_existing_fpm_status_response')
         status = json.loads(body[1])
@@ -731,12 +789,15 @@ class ExistingRelease:
                     current_stat.st_ino != path_stat.st_ino or current_stat.st_dev != path_stat.st_dev):
                 raise Refuse('dedicated_cron_file_compare_and_swap_refused')
             self.atomic(path, content, metadata)
+            # Record the completed atomic transition before any post-write
+            # checks can raise, so the caller's rollback knows what to undo.
+            self.cron_paused = target_sha == self.cron_paused_sha
+            self.cron_file_current_sha = target_sha
         finally:
             os.close(fd)
         if digest(path) != target_sha:
             raise Refuse('dedicated_cron_file_write_verification_failed')
         self.cron_file_metadata(path)
-        self.cron_file_current_sha = target_sha
 
     def atomic(self, path, data, metadata):
         path = pathlib.Path(path)
@@ -859,8 +920,10 @@ class ExistingRelease:
 
     def check_untracked_runtime(self):
         known = set(self.p['live_manifest']['files'])
-        preserved = self.p.get('preserve_copy_paths', []) + self.p.get('preserve_link_paths', [])
-        automatic = ['bootstrap/cache', 'packages/leolnid/common-deploy']
+        copy_paths = self.effective_preserve_copy_paths()
+        self.user_managed_uploads_fingerprint = self.current_user_managed_uploads_fingerprint()
+        preserved = copy_paths + self.p.get('preserve_link_paths', [])
+        automatic = ['bootstrap/cache', 'packages/leolnid/common-deploy', 'public/filemanager/uploads']
         if self.standard_public_storage:
             automatic.append('public/storage')
         prefixes = preserved + automatic
@@ -895,6 +958,9 @@ class ExistingRelease:
 
     def prepare(self):
         self.phase = 'stage_prepare'
+        copy_paths = self.effective_preserve_copy_paths()
+        if self.current_user_managed_uploads_fingerprint() != self.user_managed_uploads_fingerprint:
+            raise Refuse('customer_uploads_changed_after_preflight')
         stamp = datetime.datetime.now(datetime.timezone.utc).strftime('%Y%m%dT%H%M%SZ')
         self.stage = self.root.parent / ('.' + self.p['project'] + '-candidate-' + stamp + '-' + secrets.token_hex(4))
         self.old_root = self.root.parent / ('.' + self.p['project'] + '-previous-' + stamp + '-' + secrets.token_hex(4))
@@ -906,7 +972,7 @@ class ExistingRelease:
         self.stage.mkdir(mode=0o755)
         with tarfile.open(self.archive) as archive:
             members = archive.getmembers()
-            copy_roots=[self.root/'vendor',*[self.root/x for x in self.p.get('preserve_copy_paths',[])]]
+            copy_roots=[self.root/'vendor',*[self.root/x for x in copy_paths]]
             copy_size=0
             for copy_root in copy_roots:
                 for current,dirs,files in os.walk(copy_root,followlinks=False):
@@ -917,6 +983,8 @@ class ExistingRelease:
             for member in members:
                 rel = source_path(member.name.rstrip('/'))
                 parts = pathlib.PurePosixPath(rel).parts
+                if self.user_managed_path(rel):
+                    raise Refuse('customer_uploads_must_not_be_in_release_artifact')
                 if '.git' in parts or any(x in ['.env','auth.json','ansible.key'] for x in parts) or parts[0] in ['storage','vendor'] or rel.startswith('bootstrap/cache/') and not rel.endswith('.gitignore'):
                     raise Refuse('protected_or_secret_artifact_member')
                 if member.isdev() or member.isfifo() or member.islnk():
@@ -939,7 +1007,7 @@ class ExistingRelease:
         if self.standard_public_storage:
             self.links['public/storage'] = (self.root/'public/storage').resolve()
         self.preserved_copy_fingerprints={}
-        for rel in self.p.get('preserve_copy_paths', []):
+        for rel in copy_paths:
             src, dst = self.root / rel, self.stage / rel
             if dst.exists() or dst.is_symlink() or not src.exists():
                 raise Refuse('ambiguous_preserved_artifact')
@@ -951,6 +1019,12 @@ class ExistingRelease:
             else:
                 dst.parent.mkdir(parents=True, exist_ok=True)
                 shutil.copy2(src, dst)
+            if rel == 'public/filemanager/uploads':
+                self.preserve_user_managed_metadata(src, dst)
+                if self.user_managed_tree_fingerprint(dst) != self.user_managed_uploads_fingerprint:
+                    raise Refuse('customer_uploads_metadata_or_content_changed_during_copy')
+            if self.tree_fingerprint(dst) != self.preserved_copy_fingerprints[rel]:
+                raise Refuse('preserved_artifact_copy_mismatch')
         for rel in self.p.get('preserve_link_paths', []):
             self.links[rel] = (self.root / rel).resolve(strict=True)
         for rel, anchor in self.links.items():
@@ -963,6 +1037,8 @@ class ExistingRelease:
             for name in dirs + files:
                 path = pathlib.Path(root) / name
                 if path.is_symlink():
+                    continue
+                if self.user_managed_path(path.relative_to(self.stage).as_posix()):
                     continue
                 mode = 0o755 if path.is_dir() or path.stat().st_mode & 0o111 else 0o644
                 os.chown(path, self.uid, self.gid)
@@ -1063,6 +1139,8 @@ class ExistingRelease:
             raise Refuse('fpm_configuration_changed_during_stage')
         if any(self.tree_fingerprint(self.root/rel)!=h for rel,h in self.preserved_copy_fingerprints.items()):
             raise Refuse('preserved_artifacts_changed_during_stage_build')
+        if self.current_user_managed_uploads_fingerprint() != self.user_managed_uploads_fingerprint:
+            raise Refuse('customer_uploads_changed_during_stage_build')
         rows,_ = self.workers()
         if rows != self.worker_rows:
             raise Refuse('worker_pid_changed_before_cutover')
@@ -1086,6 +1164,9 @@ class ExistingRelease:
             link.symlink_to(anchor,target_is_directory=anchor.is_dir())
         self.stage.rename(self.root)
         self.swapped = True
+        if ('public/filemanager/uploads' in self.preserved_copy_fingerprints and
+                self.user_managed_tree_fingerprint(self.root/'public/filemanager/uploads') != self.user_managed_uploads_fingerprint):
+            raise Refuse('customer_uploads_not_preserved_in_cutover')
         self.build_config()
         if digest(self.root/'.env') != self.env_hash or (self.root/'.env').stat().st_ino != self.anchor_inodes['env'] or (self.root/'storage').stat().st_ino != self.anchor_inodes['storage']:
             raise Refuse('runtime_anchor_changed')

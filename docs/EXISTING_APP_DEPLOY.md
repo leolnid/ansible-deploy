@@ -47,7 +47,13 @@ runtime symlinks to chmod customer data. Explicit `preserve_copy_paths` and
 `preserve_link_paths` cover generated assets and non-Git runtime components;
 unclassified files in application/public trees cause a refusal. Standard
 `public/storage` links are retained automatically only inside the existing
-storage anchor. No source or private runtime data is uploaded to Git.
+storage anchor. Existing tracked `public/filemanager/uploads` files are not
+removed from the repository, but the builder excludes that tree from release
+archives and manifests. If the directory exists at preflight, its live tree is
+fingerprinted, copied into the staged release, and checked again before the
+atomic switch; manifest checks do not treat these customer-managed files as
+immutable source. A symlink at this path requires an explicit
+`preserve_link_paths` entry. This does not change repository contents.
 
 Both source manifests and the archive digest are checked. Free space must
 cover source extraction, the copied vendor/preserved tree and the configured

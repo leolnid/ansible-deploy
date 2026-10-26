@@ -2,6 +2,11 @@
 """Build immutable code from Git blobs; materialize verified LFS and pinned common."""
 import argparse, gzip, hashlib, io, json, pathlib, re, subprocess, tarfile
 COMMON='packages/leolnid/common'
+# This tree contains customer-managed files in existing repositories. It is
+# never part of an immutable application-code artifact.
+USER_DATA_PREFIXES=('public/filemanager/uploads',)
+def user_data_path(target):
+    return any(target==prefix or target.startswith(prefix+'/')for prefix in USER_DATA_PREFIXES)
 
 def git(repo, *args):
     return subprocess.check_output(['git','-C',str(repo),*args],stderr=subprocess.DEVNULL)
@@ -45,6 +50,7 @@ def build(repo, revision, destination, common_checkout=None):
                 git(trusted,'cat-file','-e',oid+'^{commit}')
                 links[target]=oid;used_common=True;walk(trusted,oid,target+'/',True);continue
             if kind!='blob' or mode not in ['100644','100755']:raise ValueError('unsupported_git_entry')
+            if user_data_path(target):continue
             if materialized:
                 if not(name.startswith(('src/','config/','routes/','resources/'))or name=='composer.json'):continue
             elif parts[0]in['storage','vendor','.deploy']or name.startswith('bootstrap/cache/')or parts[:3]==('packages','leolnid','common-deploy'):continue

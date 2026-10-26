@@ -99,14 +99,15 @@ class SandboxRelease(m.ExistingRelease):
 class ContractTests(unittest.TestCase):
     def setUp(self):
         self.tmp=tempfile.TemporaryDirectory(prefix='.repeat-package-test-',dir=FIXTURE_ROOT);self.base=pathlib.Path(self.tmp.name);self.live=self.base/'application';self.live.mkdir();(self.live/'app').mkdir();(self.live/'bootstrap/cache').mkdir(parents=True);(self.live/'storage/app').mkdir(parents=True);(self.live/'.env').write_bytes(b'SYNTHETIC_NOT_A_REAL_CREDENTIAL=fixture\n');(self.live/'.env').chmod(0o640);(self.live/'storage/app/customer-data.txt').write_bytes(b'synthetic-user-data');(self.live/'storage/app/customer-data.txt').chmod(0o664);(self.live/'bootstrap/cache/config.php').write_bytes(b'synthetic-old-cache');(self.live/'bootstrap/cache/config.php').chmod(0o640);(self.live/'vendor/composer').mkdir(parents=True);(self.live/'vendor/composer/autoload_real.php').write_text('<?php');(self.live/'vendor/composer/platform_check.php').write_text('<?php');(self.base/'nginx.conf').write_bytes(b'server { server_name fixture.example.invalid; }');(self.base/'supervisor.conf').write_bytes(b'synthetic-existing-topology')
-        self.old={'app/Marker.php':b'<?php // old\n','composer.json':b'{"require":{"php":"^8.5"}}\r\n','composer.lock':b'{"packages":[]}\r\n','bootstrap/app.php':b'<?php // synthetic bootstrap\n'}
+        self.user_upload=self.live/'public/filemanager/uploads/416255.png'
+        self.old={'app/Marker.php':b'<?php // old\n','composer.json':b'{"require":{"php":"^8.5"}}\n','composer.lock':b'{"packages":[]}\n','bootstrap/app.php':b'<?php // synthetic bootstrap\n'}
         self.new={**self.old,'app/Marker.php':b'<?php // new\n'}
         for name,data in self.old.items():p=self.live/name;p.parent.mkdir(parents=True,exist_ok=True);p.write_bytes(data)
         self.archive=self.base/'source.tar.gz'
         with tarfile.open(self.archive,'w:gz') as t:
             for name,data in self.new.items():
-                data=data.replace(b'\r\n',b'\n');info=tarfile.TarInfo(name);info.size=len(data);info.mode=0o666;t.addfile(info,io.BytesIO(data))
-        manifest=lambda files,sha:{'candidate_commit':sha*40,'files':{n:h(v.replace(b'\r\n',b'\n')) for n,v in files.items()},'normalization_by_path':{n:'crlf_to_lf' for n in files}}
+                data=data.replace(b'\n',b'\n');info=tarfile.TarInfo(name);info.size=len(data);info.mode=0o666;t.addfile(info,io.BytesIO(data))
+        manifest=lambda files,sha:{'candidate_commit':sha*40,'files':{n:h(v.replace(b'\n',b'\n')) for n,v in files.items()},'normalization_by_path':{n:'crlf_to_lf' for n in files}}
         self.profile={'schema_version':1,'project':'fixture','application_root':str(self.live),'php_cli':'/usr/bin/php8.5','php_minor':'8.5','fpm_socket':'/run/php/php8.5-fpm.sock','nginx_config':'/etc/nginx/sites-enabled/fixture.conf','server_names':['fixture.example.invalid'],'public_baselines':{'fixture.example.invalid':{'80':200,'443':200}},'worker_groups':{'fixture':1},'supervisor_config_hashes':{'/etc/supervisor/conf.d/fixture.conf':'a'*64},'live_manifest':manifest(self.old,'a'),'candidate_manifest':manifest(self.new,'b'),'source_archive_sha256':m.digest(self.archive),'backup_reference':'synthetic-verified-backup','server_identity_sha256':'c'*64,'fpm_status_path':'/existing-status','fpm_pool':'fixture','minimum_free_bytes':0,'drain_timeout':.01,'start_timeout':.01}
     def tearDown(self):
         target=self.base.resolve();assert target.parent==FIXTURE_ROOT and target.name.startswith('.repeat-package-test-');self.tmp.cleanup()
@@ -120,6 +121,7 @@ class ContractTests(unittest.TestCase):
         except BaseException:r.rollback();raise
     def assert_original(self,r):
         self.assertEqual((self.live/'app/Marker.php').read_bytes(),self.old['app/Marker.php']);self.assertEqual((self.live/'.env').read_bytes(),b'SYNTHETIC_NOT_A_REAL_CREDENTIAL=fixture\n');self.assertEqual((self.live/'storage/app/customer-data.txt').read_bytes(),b'synthetic-user-data');self.assertEqual(r.cron_current,r.cron_before);self.assertEqual(r.nginx_path.read_bytes(),r.nginx_before);self.assertTrue(all(x['state']=='RUNNING' for x in r.statuses().values()))
+        if self.user_upload.exists():self.assertEqual(self.user_upload.read_bytes(),b'customer upload differs from tracked Git blob')
     def special_profile(self):
         profile=copy.deepcopy(self.profile);profile.pop('nginx_config')
         http_path='/etc/nginx/sites-available/fixture-http.conf';https_path='/etc/nginx/sites-available/fixture-https.conf'
@@ -143,6 +145,31 @@ class ContractTests(unittest.TestCase):
         return r
     def test_success_preserves_anchor_inodes_and_runtime_permissions(self):
         env=(self.live/'.env').stat().st_ino;storage=(self.live/'storage').stat().st_ino;r=self.release();out=self.apply(r);self.assertEqual(out['status'],'PASS');self.assertEqual((self.live/'.env').stat().st_ino,env);self.assertEqual((self.live/'storage').stat().st_ino,storage);self.assertEqual((self.live/'app/Marker.php').stat().st_mode&0o777,0o644);self.assertEqual((self.live/'storage/app/customer-data.txt').stat().st_mode&0o777,0o664);self.assertEqual((self.live/'bootstrap/cache/config.php').stat().st_mode&0o777,0o640);self.assertTrue(r.old_root.is_dir());self.assertEqual(r.cron_current,r.cron_before)
+    def test_tracked_customer_upload_is_preserved_outside_the_candidate_manifest(self):
+        self.user_upload.parent.mkdir(parents=True);self.user_upload.write_bytes(b'customer upload differs from tracked Git blob')
+        self.user_upload.chmod(0o640);os.utime(self.user_upload,ns=(1700000000000000000,1700000000000000000))
+        expected_metadata=(self.user_upload.stat().st_uid,self.user_upload.stat().st_gid,stat.S_IMODE(self.user_upload.stat().st_mode),self.user_upload.stat().st_mtime_ns)
+        r=self.release();upload='public/filemanager/uploads/416255.png'
+        r.p['live_manifest']['files'][upload]=h(b'older tracked Git version')
+        out=self.apply(r)
+        staged=self.live/upload
+        self.assertEqual(out['status'],'PASS');self.assertEqual(staged.read_bytes(),b'customer upload differs from tracked Git blob')
+        actual=staged.stat();self.assertEqual((actual.st_uid,actual.st_gid,stat.S_IMODE(actual.st_mode),actual.st_mtime_ns),expected_metadata)
+        self.assertNotIn(upload,r.p['candidate_manifest']['files'])
+        self.assertEqual(r.preserved_copy_fingerprints["public/filemanager/uploads"],r.tree_fingerprint(self.live/'public/filemanager/uploads'))
+    def test_customer_upload_change_after_preflight_refuses_before_staging(self):
+        self.user_upload.parent.mkdir(parents=True);self.user_upload.write_bytes(b'customer upload before preflight')
+        r=self.release();r.preflight();self.user_upload.write_bytes(b'customer upload received during preflight')
+        with self.assertRaisesRegex(m.Refuse,'customer_uploads_changed_after_preflight'):
+            r.prepare()
+        self.assertEqual(self.user_upload.read_bytes(),b'customer upload received during preflight')
+        self.assertIsNone(getattr(r,'stage',None));self.assertEqual(r.events,[])
+    def test_new_upload_directory_after_preflight_refuses_before_staging(self):
+        r=self.release();r.preflight();self.user_upload.parent.mkdir(parents=True);self.user_upload.write_bytes(b'first customer upload')
+        with self.assertRaisesRegex(m.Refuse,'customer_uploads_changed_after_preflight'):
+            r.prepare()
+        self.assertEqual(self.user_upload.read_bytes(),b'first customer upload')
+        self.assertIsNone(getattr(r,'stage',None));self.assertEqual(r.events,[])
     def test_recorded_state_advances_and_rejects_redirected_directory(self):
         r=self.release();self.apply(r)
         state=json.loads(r.state_path().read_text())
@@ -188,7 +215,7 @@ class ContractTests(unittest.TestCase):
         self.profile['live_manifest']=copy.deepcopy(self.profile['candidate_manifest']);self.new['app/Marker.php']=b'<?php // next release\n'
         with tarfile.open(self.archive,'w:gz')as archive:
             for name,data in self.new.items():
-                data=data.replace(b'\r\n',b'\n');item=tarfile.TarInfo(name);item.size=len(data);item.mtime=0;archive.addfile(item,io.BytesIO(data))
+                data=data.replace(b'\n',b'\n');item=tarfile.TarInfo(name);item.size=len(data);item.mtime=0;archive.addfile(item,io.BytesIO(data))
         self.profile['source_archive_sha256']=m.digest(self.archive);self.profile['candidate_manifest']['candidate_commit']='c'*40;self.profile['candidate_manifest']['files']['app/Marker.php']=h(self.new['app/Marker.php'])
         second=self.release();self.apply(second);self.assertNotEqual(middle,int((self.live/'app/Marker.php').stat().st_mtime));self.assertEqual((self.live/'app/Marker.php').read_bytes(),self.new['app/Marker.php'])
     def test_fpm_opcache_off_unbounded_or_ambiguous_is_refused(self):
@@ -326,6 +353,28 @@ class ContractTests(unittest.TestCase):
         r.cron(paused);self.assertEqual(self.cron_file.read_bytes(),paused);self.assertEqual(r.cron_file_current_sha,h(paused))
         r.cron(r.cron_before);self.assertEqual(self.cron_file.read_bytes(),self.cron_original)
         self.assertFalse(any(event and event[0]=='crontab' for event in r.events))
+    def test_post_atomic_dedicated_cron_verification_failure_is_rolled_back(self):
+        r=self.release_for_profile(self.special_profile())
+        mapping={'/etc/nginx/sites-available/fixture-http.conf':self.special_http,'/etc/nginx/sites-available/fixture-https.conf':self.special_https,'/etc/cron.d/fixture':self.cron_file}
+        r.system_path=lambda value:mapping[value];r.nginx_path_in_scope=lambda target:True
+        preflight=r.preflight
+        def prepare_special_profile():
+            report=preflight();r.prepare_nginx();r.prepare_cron_file();return report
+        r.preflight=prepare_special_profile
+        original_digest=m.digest;injected=False
+        def fail_paused_digest(path):
+            nonlocal injected
+            if pathlib.Path(path)==self.cron_file and self.cron_file.read_bytes()==r.cron_paused_content and not injected:
+                injected=True
+                return '0'*64
+            return original_digest(path)
+        with mock.patch.object(m,'digest',side_effect=fail_paused_digest):
+            with self.assertRaisesRegex(m.Refuse,'dedicated_cron_file_write_verification_failed'):
+                self.apply(r)
+        self.assertTrue(injected);self.assertFalse(r.cron_paused)
+        self.assertEqual(self.cron_file.read_bytes(),self.cron_original)
+        self.assertEqual(self.cron_file.stat().st_mode&0o777,0o644)
+        self.assertEqual(self.special_http.read_bytes(),self.http_config);self.assertEqual(self.special_https.read_bytes(),self.https_config)
     def test_dedicated_cron_refuses_wrong_user_column(self):
         p=self.special_profile();self.cron_original=self.cron_original.replace(b'www-data',b'root')
         p['cron_file_sha256']=h(self.cron_original);p['cron_file_scheduler_user']='www-data';self.cron_file.write_bytes(self.cron_original)
