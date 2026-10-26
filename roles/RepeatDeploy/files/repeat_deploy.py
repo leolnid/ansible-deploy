@@ -6,7 +6,7 @@ cache flush or topology generation is part of this executor.
 """
 from __future__ import annotations
 import argparse, copy, datetime, fcntl, hashlib, json, os, pathlib, re, secrets
-import shutil, signal, stat, subprocess, sys, tarfile, time, pwd, importlib.util
+import shutil, signal, stat, subprocess, sys, tarfile, time, pwd, grp, importlib.util
 
 class Refuse(RuntimeError):
     pass
@@ -42,19 +42,34 @@ def validate_profile(p):
     if not isinstance(p, dict) or p.get('schema_version') != 1:
         raise Refuse('unsupported_profile_schema')
     required = ['project', 'application_root', 'php_cli', 'php_minor', 'fpm_socket',
-                'nginx_config', 'server_names', 'public_baselines', 'worker_groups',
+                'server_names', 'public_baselines', 'worker_groups',
                 'supervisor_config_hashes', 'live_manifest', 'candidate_manifest',
                 'source_archive_sha256', 'backup_reference', 'server_identity_sha256']
     if any(k not in p for k in required):
         raise Refuse('incomplete_profile')
+    if ('nginx_config' in p) == ('nginx_configs' in p):
+        raise Refuse('exactly_one_nginx_profile_mode_required')
+    if 'nginx_config' in p:
+        path_value(p['nginx_config'])
+        if not p['nginx_config'].startswith('/etc/nginx/') or 'nginx_config_hashes' in p:
+            raise Refuse('nginx_scope_required')
+    else:
+        paths = p['nginx_configs']
+        hashes = p.get('nginx_config_hashes')
+        if (not isinstance(paths, list) or len(paths) != 2 or
+                any(not isinstance(value, str) or not value.startswith('/etc/nginx/') for value in paths) or
+                len(set(paths)) != 2 or
+                not isinstance(hashes, dict) or set(hashes) != set(paths) or
+                any(not re.fullmatch(r'[0-9a-f]{64}', value) for value in hashes.values())):
+            raise Refuse('exact_two_hashed_nginx_configs_required')
+        for value in paths:
+            path_value(value)
     if not re.fullmatch(r'[a-z0-9][a-z0-9-]{0,63}', p['project']):
         raise Refuse('invalid_project')
-    for name in ['application_root', 'php_cli', 'fpm_socket', 'nginx_config']:
+    for name in ['application_root', 'php_cli', 'fpm_socket']:
         path_value(p[name])
     if not any(p['application_root'].startswith(root) for root in ['/var/www/', '/home/user/www/', '/srv/']):
         raise Refuse('application_root_outside_supported_scope')
-    if not p['nginx_config'].startswith('/etc/nginx/'):
-        raise Refuse('nginx_scope_required')
     if not re.fullmatch(r'8\.[0-9]+', p['php_minor']):
         raise Refuse('explicit_php_minor_required')
     if not isinstance(p['server_names'], list) or not p['server_names'] or len(set(p['server_names'])) != len(p['server_names']):
@@ -109,7 +124,21 @@ def validate_profile(p):
             raise Refuse('invalid_bounded_timeout')
     if type(p.get('minimum_free_bytes',1024**3)) is not int or p.get('minimum_free_bytes',1024**3) < 0:
         raise Refuse('invalid_free_space_reserve')
-    allowed = set(required) | {'schema_version','cron_user','preserve_copy_paths','preserve_link_paths','same_inode_config_paths','drain_timeout','start_timeout','minimum_free_bytes','config_change_hashes','fpm_status_path','fpm_pool','fpm_status_socket','queue_adapter'}
+    cron_file_fields = {'cron_file', 'cron_file_sha256', 'cron_file_owner', 'cron_file_group', 'cron_file_mode', 'cron_file_scheduler_user'}
+    present_cron_file_fields = cron_file_fields & set(p)
+    if present_cron_file_fields:
+        if present_cron_file_fields != cron_file_fields or 'cron_user' in p:
+            raise Refuse('complete_dedicated_cron_file_profile_required')
+        if (any(not isinstance(p[field], str) for field in cron_file_fields) or
+                not re.fullmatch(r'/etc/cron\.d/[A-Za-z0-9_.-]{1,128}', p['cron_file']) or
+                p['cron_file'].endswith('/.') or p['cron_file'].endswith('/..') or
+                not re.fullmatch(r'[0-9a-f]{64}', p['cron_file_sha256']) or
+                not re.fullmatch(r'[A-Za-z_][A-Za-z0-9_.-]{0,30}', p['cron_file_owner']) or
+                not re.fullmatch(r'[A-Za-z_][A-Za-z0-9_.-]{0,30}', p['cron_file_group']) or
+                p['cron_file_mode'] not in ['0644', '0600'] or
+                not re.fullmatch(r'[A-Za-z_][A-Za-z0-9_.-]{0,30}', p['cron_file_scheduler_user'])):
+            raise Refuse('invalid_dedicated_cron_file_scope')
+    allowed = set(required) | {'schema_version','nginx_config','nginx_configs','nginx_config_hashes','cron_user', *cron_file_fields,'preserve_copy_paths','preserve_link_paths','same_inode_config_paths','drain_timeout','start_timeout','minimum_free_bytes','config_change_hashes','fpm_status_path','fpm_pool','fpm_status_socket','queue_adapter'}
     if set(p) - allowed:
         raise Refuse('unknown_profile_field')
     if p.get('queue_adapter','database')not in ['database','native_redis']:raise Refuse('unsupported_explicit_queue_adapter')
@@ -142,6 +171,137 @@ class ExistingRelease:
         if q.returncode not in allowed:
             raise Refuse('command_failed_' + pathlib.Path(args[0]).name)
         return q.stdout
+
+    def system_path(self, value):
+        return path_value(value)
+
+    def nginx_profile_paths(self):
+        return self.p['nginx_configs'] if 'nginx_configs' in self.p else [self.p['nginx_config']]
+
+    def nginx_path_in_scope(self, target):
+        return str(target).startswith('/etc/nginx/')
+
+    def nginx_snapshot(self):
+        snapshots = {}
+        for configured in self.nginx_profile_paths():
+            entry = self.system_path(configured)
+            entry_lstat = entry.lstat()
+            entry_target = os.readlink(entry) if entry.is_symlink() else None
+            target = entry.resolve(strict=True)
+            if not self.nginx_path_in_scope(target) or not target.is_file():
+                raise Refuse('nginx_target_outside_scope')
+            metadata = target.stat()
+            content = target.read_bytes()
+            current = {'entry': entry, 'entry_lstat': entry_lstat, 'entry_target': entry_target,
+                       'path': target, 'stat': metadata, 'before': content, 'before_sha': sha(content)}
+            if 'nginx_configs' in self.p and self.p['nginx_config_hashes'][configured] != current['before_sha']:
+                raise Refuse('nginx_config_hash_mismatch')
+            snapshots[configured] = current
+        if len({str(value['path']) for value in snapshots.values()}) != len(snapshots):
+            raise Refuse('nginx_config_targets_must_be_distinct')
+        return snapshots
+
+    def check_nginx_snapshot(self, allowed_hashes=None):
+        for configured, snapshot in self.nginx_snapshots.items():
+            entry = snapshot['entry']
+            current_entry = entry.lstat()
+            current_target = os.readlink(entry) if entry.is_symlink() else None
+            if (entry.is_symlink() != (snapshot['entry_target'] is not None) or
+                    (snapshot['entry_target'] is not None and current_entry.st_ino != snapshot['entry_lstat'].st_ino) or
+                    current_target != snapshot['entry_target'] or
+                    entry.resolve(strict=True) != snapshot['path']):
+                raise Refuse('nginx_entrypoint_was_changed')
+            current_sha = digest(snapshot['path'])
+            accepted = (allowed_hashes or {}).get(configured, {snapshot['before_sha']})
+            if current_sha not in accepted:
+                raise Refuse('nginx_config_changed_during_stage')
+
+    @staticmethod
+    def make_nginx_gate(content):
+        blocks = list(re.finditer(rb'\bserver\s*\{', content))
+        names = re.findall(rb'\bserver_name\s+([^;]+);', content)
+        if not names or len(blocks) != len(names):
+            raise Refuse('nginx_server_structure_not_supported')
+        gated = content
+        for block in reversed(blocks):
+            gated = gated[:block.end()] + b'\n return 503; # reviewed repeat deployment\n' + gated[block.end():]
+        return gated
+
+    def prepare_nginx(self):
+        self.nginx_snapshots = self.nginx_snapshot()
+        if 'nginx_configs' not in self.p:
+            _, snapshot = next(iter(self.nginx_snapshots.items()))
+            self.nginx_entry = snapshot['entry']
+            self.nginx_entry_lstat = snapshot['entry_lstat']
+            self.nginx_entry_target = snapshot['entry_target']
+            self.nginx_path = snapshot['path']
+            self.nginx_stat = snapshot['stat']
+            self.nginx_before = snapshot['before']
+        all_names = set()
+        all_bindings = []
+        self.nginx_gates = {}
+        if 'nginx_configs' not in self.p:
+            _, snapshot = next(iter(self.nginx_snapshots.items()))
+            content = snapshot['before']
+            names = re.findall(rb'\bserver_name\s+([^;]+);', content)
+            if not names or {part.decode() for row in names for part in row.split()} != set(self.p['server_names']):
+                raise Refuse('nginx_contains_foreign_or_wildcard_names')
+            bindings = re.findall(rb'fastcgi_pass\s+unix:([^;]+);', content)
+            if not bindings or any(pathlib.Path(binding.decode()).resolve()!=path_value(self.p['fpm_socket']).resolve() for binding in bindings):
+                raise Refuse('owned_vhost_fpm_binding_mismatch')
+            self.nginx_gates[next(iter(self.nginx_snapshots))] = self.make_nginx_gate(content)
+            self.nginx_gate = self.nginx_gates[next(iter(self.nginx_snapshots))]
+            return self.nginx_snapshots
+        for configured, snapshot in self.nginx_snapshots.items():
+            content = snapshot['before']
+            names = re.findall(rb'\bserver_name\s+([^;]+);', content)
+            if not names:
+                raise Refuse('nginx_contains_no_owned_server_names')
+            tokens = [part.decode('ascii', 'strict') for row in names for part in row.split()]
+            if any(host not in self.p['server_names'] for host in tokens):
+                raise Refuse('nginx_contains_foreign_or_wildcard_names')
+            all_names.update(tokens)
+            self.nginx_gates[configured] = self.make_nginx_gate(content)
+            bindings = re.findall(rb'\bfastcgi_pass\s+([^;]+);', content)
+            for binding in bindings:
+                if not binding.startswith(b'unix:'):
+                    raise Refuse('owned_vhost_fpm_binding_mismatch')
+                all_bindings.append(binding[5:])
+        if all_names != set(self.p['server_names']):
+            raise Refuse('nginx_owned_hostname_union_mismatch')
+        if not all_bindings or any(pathlib.Path(s.decode()).resolve()!=path_value(self.p['fpm_socket']).resolve() for s in all_bindings):
+            raise Refuse('owned_vhost_fpm_binding_mismatch')
+        return self.nginx_snapshots
+
+    def prepare_cron_file(self):
+        self.cron_file_path = self.system_path(self.p['cron_file'])
+        self.cron_file_path_lstat = self.cron_file_path.lstat()
+        self.cron_file_stat = self.cron_file_metadata(self.cron_file_path)
+        self.cron_before = self.cron_file_path.read_bytes()
+        self.cron_before_sha = sha(self.cron_before)
+        if self.cron_before_sha != self.p['cron_file_sha256']:
+            raise Refuse('dedicated_cron_file_hash_mismatch')
+        lines = self.cron_before.splitlines(keepends=True)
+        matches = []
+        for i, line in enumerate(lines):
+            if not line.strip() or line.lstrip().startswith(b'#'):
+                continue
+            fields = line.split()
+            if len(fields) < 8:
+                continue
+            if any(re.search(re.escape(str(root).encode()) + rb'(?=/|\s|;|$)', line) for root in [self.entry, self.root]) and b'artisan schedule:run' in line:
+                matches.append((i, fields))
+        if (len(matches) != 1 or matches[0][1][5].decode('ascii', 'strict') != self.p['cron_file_scheduler_user'] or
+                self.p['php_cli'].encode() not in lines[matches[0][0]] or
+                b'artisan schedule:run' not in lines[matches[0][0]]):
+            raise Refuse('exact_single_dedicated_scheduler_row_required')
+        self.cron_file_scheduler_line = matches[0][0]
+        paused = lines.copy()
+        paused[self.cron_file_scheduler_line] = b'# REVIEWED_REPEAT_DEPLOY_PAUSE ' + paused[self.cron_file_scheduler_line]
+        self.cron_paused_content = b''.join(paused)
+        self.cron_paused_sha = sha(self.cron_paused_content)
+        self.cron_file_current_sha = self.cron_before_sha
+        return self.cron_before
 
     def checkpoint(self):
         if self.control is not None:
@@ -446,7 +606,10 @@ class ExistingRelease:
 
     def restore_nginx_public(self, receipt_key):
         previous=self.nginx_worker_pids()
-        self.nginx(self.nginx_before)
+        if 'nginx_configs' in self.p:
+            self.nginx({key: row['before'] for key, row in self.nginx_snapshots.items()})
+        else:
+            self.nginx(self.nginx_before)
         until=time.monotonic()+10
         while any(pathlib.Path('/proc',str(pid)).exists() for pid in previous):
             if time.monotonic()>until:
@@ -455,8 +618,51 @@ class ExistingRelease:
         self.report[receipt_key]={'previous_worker_pids':sorted(previous),'current_worker_pids':sorted(self.nginx_worker_pids())}
 
     def nginx(self, content):
+        if 'nginx_configs' in self.p:
+            self.nginx_multi(content)
+            return
         self.atomic(self.nginx_path, content, self.nginx_stat)
         self.run(['nginx', '-t'])
+        self.run(['systemctl', 'reload', 'nginx'])
+
+    def nginx_multi(self, contents):
+        if not isinstance(contents, dict) or set(contents) != set(self.nginx_snapshots):
+            raise Refuse('incomplete_nginx_generation')
+        previous_hashes = {key: {row['before_sha'], sha(self.nginx_gates[key])}
+                           for key, row in self.nginx_snapshots.items()}
+        self.check_nginx_snapshot(previous_hashes)
+        written = []
+        try:
+            for key, snapshot in self.nginx_snapshots.items():
+                current = digest(snapshot['path'])
+                expected = {snapshot['before_sha'], sha(self.nginx_gates[key])}
+                if current not in expected:
+                    raise Refuse('nginx_config_changed_before_atomic_write')
+                target_sha = sha(contents[key])
+                if current != target_sha:
+                    self.atomic(snapshot['path'], contents[key], snapshot['path'].stat())
+                    written.append(key)
+            if any(digest(snapshot['path']) != sha(contents[key]) for key, snapshot in self.nginx_snapshots.items()):
+                raise Refuse('nginx_generation_changed_before_validation')
+            self.run(['nginx', '-t'])
+            if any(digest(snapshot['path']) != sha(contents[key]) for key, snapshot in self.nginx_snapshots.items()):
+                raise Refuse('nginx_generation_changed_before_reload')
+        except BaseException:
+            try:
+                for key in reversed(written):
+                    snapshot = self.nginx_snapshots[key]
+                    if digest(snapshot['path']) != sha(contents[key]):
+                        raise Refuse('nginx_partial_write_restore_refused')
+                    self.atomic(snapshot['path'], snapshot['before'], snapshot['path'].stat())
+                self.run(['nginx', '-t'])
+            except BaseException as restore_error:
+                self.gated = True
+                raise Refuse('nginx_partial_generation_restore_failed') from restore_error
+            raise
+        # A failed reload may still have switched generations, so mark the
+        # gate before invoking systemd and let the outer rollback restore both.
+        if contents == self.nginx_gates:
+            self.gated = True
         self.run(['systemctl', 'reload', 'nginx'])
 
     def nginx_worker_pids(self):
@@ -472,7 +678,7 @@ class ExistingRelease:
     def gate(self):
         previous_workers=self.nginx_worker_pids()
         self.gated = True
-        self.nginx(self.nginx_gate)
+        self.nginx(self.nginx_gates if 'nginx_configs' in self.p else self.nginx_gate)
         for _ in range(25):
             if all(value == 503 for row in self.public_codes().values() for value in row.values()):
                 deadline=time.monotonic()+self.p.get('drain_timeout',120)
@@ -485,7 +691,52 @@ class ExistingRelease:
         raise Refuse('owned_http_gate_not_confirmed')
 
     def cron(self, content):
+        if 'cron_file' in self.p:
+            target_sha = sha(content)
+            if target_sha == self.cron_paused_sha:
+                expected_sha = self.cron_before_sha
+            elif target_sha == self.cron_before_sha:
+                expected_sha = self.cron_paused_sha
+            else:
+                raise Refuse('unreviewed_dedicated_cron_generation')
+            self.write_cron_file(content, expected_sha, target_sha)
+            return
         self.run(['crontab', '-u', self.p.get('cron_user', 'www-data'), '-'], input=content)
+
+    def cron_file_metadata(self, path):
+        if path.is_symlink() or not path.is_file():
+            raise Refuse('dedicated_cron_file_must_be_regular')
+        metadata = path.stat()
+        try:
+            expected_uid = pwd.getpwnam(self.p['cron_file_owner']).pw_uid
+            expected_gid = grp.getgrnam(self.p['cron_file_group']).gr_gid
+        except KeyError as error:
+            raise Refuse('dedicated_cron_file_owner_unknown') from error
+        if (metadata.st_uid != expected_uid or metadata.st_gid != expected_gid or
+                f'{stat.S_IMODE(metadata.st_mode):04o}' != self.p['cron_file_mode']):
+            raise Refuse('dedicated_cron_file_metadata_mismatch')
+        return metadata
+
+    def write_cron_file(self, content, expected_sha, target_sha):
+        path = self.cron_file_path
+        metadata = self.cron_file_metadata(path)
+        flags = os.O_RDONLY | getattr(os, 'O_NOFOLLOW', 0)
+        fd = os.open(path, flags)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            current = os.read(fd, metadata.st_size + 1)
+            current_stat = os.fstat(fd)
+            path_stat = path.stat()
+            if (sha(current) != expected_sha or sha(path.read_bytes()) != expected_sha or
+                    current_stat.st_ino != path_stat.st_ino or current_stat.st_dev != path_stat.st_dev):
+                raise Refuse('dedicated_cron_file_compare_and_swap_refused')
+            self.atomic(path, content, metadata)
+        finally:
+            os.close(fd)
+        if digest(path) != target_sha:
+            raise Refuse('dedicated_cron_file_write_verification_failed')
+        self.cron_file_metadata(path)
+        self.cron_file_current_sha = target_sha
 
     def atomic(self, path, data, metadata):
         path = pathlib.Path(path)
@@ -570,43 +821,27 @@ class ExistingRelease:
         self.validate_queue_connections()
         self.counts()
         self.active_fpm_requests(self.fpm_status())
-        self.nginx_entry = path_value(self.p['nginx_config'])
-        self.nginx_entry_lstat = self.nginx_entry.lstat()
-        self.nginx_entry_target = os.readlink(self.nginx_entry) if self.nginx_entry.is_symlink() else None
-        self.nginx_path = self.nginx_entry.resolve(strict=True)
-        if not str(self.nginx_path).startswith('/etc/nginx/'):
-            raise Refuse('nginx_target_outside_scope')
-        self.nginx_stat = self.nginx_path.stat()
-        self.nginx_before = self.nginx_path.read_bytes()
+        self.prepare_nginx()
         self.fpm_opcache_guard()
-        names = re.findall(rb'\bserver_name\s+([^;]+);', self.nginx_before)
-        if not names or {part.decode() for row in names for part in row.split()} != set(self.p['server_names']):
-            raise Refuse('nginx_contains_foreign_or_wildcard_names')
-        blocks = list(re.finditer(rb'\bserver\s*\{', self.nginx_before))
-        if len(blocks) != len(names):
-            raise Refuse('nginx_server_structure_not_supported')
-        self.nginx_gate = self.nginx_before
-        for block in reversed(blocks):
-            self.nginx_gate = self.nginx_gate[:block.end()] + b'\n return 503; # reviewed repeat deployment\n' + self.nginx_gate[block.end():]
-        bindings = re.findall(rb'fastcgi_pass\s+unix:([^;]+);',self.nginx_before)
-        if not bindings or any(pathlib.Path(s.decode()).resolve()!=path_value(self.p['fpm_socket']).resolve() for s in bindings):
-            raise Refuse('owned_vhost_fpm_binding_mismatch')
         self.supervisor_hashes = {name: digest(name) for name in self.p['supervisor_config_hashes']}
         if self.supervisor_hashes != self.p['supervisor_config_hashes']:
             raise Refuse('supervisor_configuration_drift')
-        self.cron_before = self.run(['crontab', '-u', self.p.get('cron_user', 'www-data'), '-l'])
-        lines = self.cron_before.splitlines(keepends=True)
-        match = []
-        for i, line in enumerate(lines):
-            if line.lstrip().startswith(b'#'):
-                continue
-            if any(re.search(re.escape(str(root).encode()) + rb'(?=/|\s|;|$)', line) for root in [self.entry, self.root]):
-                match.append(i)
-        if len(match) != 1 or b'artisan schedule:run' not in lines[match[0]] or self.p['php_cli'].encode() not in lines[match[0]]:
-            raise Refuse('exact_single_existing_php_scheduler_required')
-        paused = lines.copy()
-        paused[match[0]] = b'# REVIEWED_REPEAT_DEPLOY_PAUSE ' + paused[match[0]]
-        self.cron_paused_content = b''.join(paused)
+        if 'cron_file' in self.p:
+            self.prepare_cron_file()
+        else:
+            self.cron_before = self.run(['crontab', '-u', self.p.get('cron_user', 'www-data'), '-l'])
+            lines = self.cron_before.splitlines(keepends=True)
+            match = []
+            for i, line in enumerate(lines):
+                if line.lstrip().startswith(b'#'):
+                    continue
+                if any(re.search(re.escape(str(root).encode()) + rb'(?=/|\s|;|$)', line) for root in [self.entry, self.root]):
+                    match.append(i)
+            if len(match) != 1 or b'artisan schedule:run' not in lines[match[0]] or self.p['php_cli'].encode() not in lines[match[0]]:
+                raise Refuse('exact_single_existing_php_scheduler_required')
+            paused = lines.copy()
+            paused[match[0]] = b'# REVIEWED_REPEAT_DEPLOY_PAUSE ' + paused[match[0]]
+            self.cron_paused_content = b''.join(paused)
         if self.public_codes() != self.p['public_baselines']:
             raise Refuse('public_baseline_drift')
         self.env_anchor = (self.root / '.env').resolve()
@@ -812,7 +1047,17 @@ class ExistingRelease:
     def cutover(self):
         self.phase = 'fresh_live_guards'
         self.manifest(self.root,self.p['live_manifest'])
-        if self.env_hash != digest(self.env_anchor) or self.old_cache != (self.root/'bootstrap/cache/config.php').read_bytes() or self.nginx_before != self.nginx_path.read_bytes() or self.cron_before != self.run(['crontab','-u',self.p.get('cron_user','www-data'),'-l']) or self.supervisor_hashes != {p:digest(p) for p in self.supervisor_hashes}:
+        if self.env_hash != digest(self.env_anchor) or self.old_cache != (self.root/'bootstrap/cache/config.php').read_bytes() or self.supervisor_hashes != {p:digest(p) for p in self.supervisor_hashes}:
+            raise Refuse('protected_runtime_drift')
+        if 'nginx_configs' in self.p:
+            self.check_nginx_snapshot()
+        elif self.nginx_before != self.nginx_path.read_bytes():
+            raise Refuse('protected_runtime_drift')
+        if 'cron_file' in self.p:
+            if digest(self.cron_file_path) != self.cron_before_sha:
+                raise Refuse('dedicated_cron_file_changed_during_stage')
+            self.cron_file_metadata(self.cron_file_path)
+        elif self.cron_before != self.run(['crontab','-u',self.p.get('cron_user','www-data'),'-l']):
             raise Refuse('protected_runtime_drift')
         if getattr(self,'fpm_config_hashes',{}) != {p:digest(p) for p in getattr(self,'fpm_config_hashes',{})}:
             raise Refuse('fpm_configuration_changed_during_stage')
@@ -856,8 +1101,8 @@ class ExistingRelease:
         if self.supervisor_hashes != {p:digest(p) for p in self.supervisor_hashes}:
             raise Refuse('supervisor_was_changed')
         self.manifest(self.root,self.p['candidate_manifest'])
-        if hasattr(self,'nginx_entry') and self.nginx_entry_target is not None and (not self.nginx_entry.is_symlink() or self.nginx_entry.lstat().st_ino!=self.nginx_entry_lstat.st_ino or os.readlink(self.nginx_entry)!=self.nginx_entry_target):
-            raise Refuse('nginx_entrypoint_was_changed')
+        if hasattr(self, 'nginx_snapshots'):
+            self.check_nginx_snapshot()
         self.phase = 'verified'
         self.report.update(status='PASS',completed_utc=datetime.datetime.now(datetime.timezone.utc).isoformat(),own_processes=len(self.statuses()),env_storage_same_inodes=True,supervisor_and_cron_topology_unchanged=True,source_permissions_normalized_in_stage_only=True,backup_reference=self.p['backup_reference'])
         self.checkpoint()

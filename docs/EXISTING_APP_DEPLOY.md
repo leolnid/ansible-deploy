@@ -112,6 +112,28 @@ The reviewed profile must specify `fpm_pool`, `fpm_status_path` and the existing
 listener, never a public Nginx endpoint. Status enrollment is a separately
 reviewed infrastructure change and is not inferred or performed by this role.
 
+Two additional runtime shapes are opt-in and must be pinned in the reviewed
+profile. The ordinary single `nginx_config` and user crontab (`cron_user`)
+behavior remains the default.
+
+For an application whose two owned vhosts are split across two files, use
+`nginx_configs` with exactly two distinct `/etc/nginx/` paths and
+`nginx_config_hashes` with the expected SHA-256 for each path. Preflight checks
+the combined server-name set for an exact match to `server_names`, rejects any
+foreign name or non-Unix/mismatched FastCGI binding, and snapshots both files.
+Apply gates both files as one generation, runs one `nginx -t` and one reload,
+then restores both files together on rollback. Any unexpected file or entry
+point drift refuses the release.
+
+For a scheduler in `/etc/cron.d`, use all of `cron_file`, `cron_file_sha256`,
+`cron_file_owner`, `cron_file_group`, `cron_file_mode` (four-digit octal text),
+and `cron_file_scheduler_user`. The file must be a regular file directly under
+`/etc/cron.d`, have the exact expected hash and metadata, and contain exactly
+one matching `artisan schedule:run` row with that scheduler-user column and
+the reviewed PHP binary. Pause and restore use a hash-checked compare-and-swap
+on only that file. A failed check never falls back to a global or per-user
+crontab.
+
 ## Pinned common source and verified LFS assets
 
 The builder accepts `--common-checkout` only for the existing

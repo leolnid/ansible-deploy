@@ -1,4 +1,5 @@
 import copy, hashlib, importlib.util, io, json, os, pathlib, shutil, tarfile, tempfile, unittest
+import grp, pwd, stat
 from unittest import mock
 MODULE=pathlib.Path(__file__).resolve().parents[2]/'roles/RepeatDeploy/files/repeat_deploy.py'
 spec=importlib.util.spec_from_file_location('repeat_deploy',MODULE);m=importlib.util.module_from_spec(spec);spec.loader.exec_module(m)
@@ -119,6 +120,27 @@ class ContractTests(unittest.TestCase):
         except BaseException:r.rollback();raise
     def assert_original(self,r):
         self.assertEqual((self.live/'app/Marker.php').read_bytes(),self.old['app/Marker.php']);self.assertEqual((self.live/'.env').read_bytes(),b'SYNTHETIC_NOT_A_REAL_CREDENTIAL=fixture\n');self.assertEqual((self.live/'storage/app/customer-data.txt').read_bytes(),b'synthetic-user-data');self.assertEqual(r.cron_current,r.cron_before);self.assertEqual(r.nginx_path.read_bytes(),r.nginx_before);self.assertTrue(all(x['state']=='RUNNING' for x in r.statuses().values()))
+    def special_profile(self):
+        profile=copy.deepcopy(self.profile);profile.pop('nginx_config')
+        http_path='/etc/nginx/sites-available/fixture-http.conf';https_path='/etc/nginx/sites-available/fixture-https.conf'
+        profile['nginx_configs']=[http_path,https_path]
+        self.http_config=b'server { listen 80; server_name fixture.example.invalid; }\n'
+        self.https_config=b'server { listen 443 ssl; server_name fixture.example.invalid; location ~ \\.php$ { fastcgi_pass unix:/run/php/php8.5-fpm.sock; } }\n'
+        self.special_http=self.base/'fixture-http.conf';self.special_https=self.base/'fixture-https.conf'
+        self.special_http.write_bytes(self.http_config);self.special_https.write_bytes(self.https_config)
+        for path in [self.special_http,self.special_https]:path.chmod(0o644)
+        profile['nginx_config_hashes']={http_path:h(self.http_config),https_path:h(self.https_config)}
+        self.cron_file=self.base/'flowwow-ms.cron'
+        self.cron_original=(b'# root-owned dedicated file\n* * * * * '+pwd.getpwuid(os.getuid()).pw_name.encode()+b' cd '+str(self.live).encode()+b' && /usr/bin/php8.5 artisan schedule:run >/dev/null 2>&1\n')
+        self.cron_file.write_bytes(self.cron_original);self.cron_file.chmod(0o644)
+        profile.update(cron_file='/etc/cron.d/fixture',cron_file_sha256=h(self.cron_original),cron_file_owner=pwd.getpwuid(os.getuid()).pw_name,cron_file_group=grp.getgrgid(os.getgid()).gr_name,cron_file_mode='0644',cron_file_scheduler_user=pwd.getpwuid(os.getuid()).pw_name)
+        return profile
+    def prepare_special_ports(self,r):
+        mapping={'/etc/nginx/sites-available/fixture-http.conf':self.special_http,'/etc/nginx/sites-available/fixture-https.conf':self.special_https,'/etc/cron.d/fixture':self.cron_file}
+        r.system_path=lambda value:mapping[value]
+        r.nginx_path_in_scope=lambda target:True
+        r.prepare_nginx();r.prepare_cron_file()
+        return r
     def test_success_preserves_anchor_inodes_and_runtime_permissions(self):
         env=(self.live/'.env').stat().st_ino;storage=(self.live/'storage').stat().st_ino;r=self.release();out=self.apply(r);self.assertEqual(out['status'],'PASS');self.assertEqual((self.live/'.env').stat().st_ino,env);self.assertEqual((self.live/'storage').stat().st_ino,storage);self.assertEqual((self.live/'app/Marker.php').stat().st_mode&0o777,0o644);self.assertEqual((self.live/'storage/app/customer-data.txt').stat().st_mode&0o777,0o664);self.assertEqual((self.live/'bootstrap/cache/config.php').stat().st_mode&0o777,0o640);self.assertTrue(r.old_root.is_dir());self.assertEqual(r.cron_current,r.cron_before)
     def test_recorded_state_advances_and_rejects_redirected_directory(self):
@@ -240,6 +262,85 @@ class ContractTests(unittest.TestCase):
             with self.assertRaises(m.Refuse):m.validate_profile(p)
     def test_production_validator_rejects_private_root_fixture(self):
         with self.assertRaises(m.Refuse):m.validate_profile(self.profile)
+    def test_special_profile_schema_requires_exact_two_hashed_nginx_files_and_complete_cron_contract(self):
+        p=self.special_profile();checked=m.validate_profile({**p,'application_root':'/srv/repeat-deploy-private-fixture/application'})
+        self.assertEqual(len(checked['nginx_configs']),2)
+        for mutate in [
+            lambda x:x.update(nginx_configs=[x['nginx_configs'][0]]),
+            lambda x:x.update(nginx_config='/etc/nginx/also.conf'),
+            lambda x:x['nginx_config_hashes'].pop(x['nginx_configs'][1]),
+            lambda x:x.update(cron_file_sha256='not-a-sha256'),
+            lambda x:x.pop('cron_file_scheduler_user'),
+            lambda x:x.update(cron_file_mode='0666'),
+            lambda x:x.update(cron_user='root'),
+        ]:
+            changed=copy.deepcopy(p);mutate(changed);changed['application_root']='/srv/repeat-deploy-private-fixture/application'
+            with self.assertRaises(m.Refuse):m.validate_profile(changed)
+    def test_special_ports_are_independent_opt_ins(self):
+        p=self.special_profile();p['application_root']='/srv/repeat-deploy-private-fixture/application'
+        only_nginx=copy.deepcopy(p)
+        for field in ['cron_file','cron_file_sha256','cron_file_owner','cron_file_group','cron_file_mode','cron_file_scheduler_user']:only_nginx.pop(field)
+        self.assertIn('nginx_configs',m.validate_profile(only_nginx))
+        only_cron=copy.deepcopy(p);only_cron['nginx_config']='/etc/nginx/sites-available/fixture.conf';only_cron.pop('nginx_configs');only_cron.pop('nginx_config_hashes')
+        self.assertIn('cron_file',m.validate_profile(only_cron))
+    def test_two_file_nginx_gate_and_restore_are_one_reload_each(self):
+        r=self.prepare_special_ports(self.release_for_profile(self.special_profile()))
+        r.nginx_multi(r.nginx_gates)
+        self.assertIn(b'return 503',self.special_http.read_bytes());self.assertIn(b'return 503',self.special_https.read_bytes())
+        self.assertEqual(sum(event[:2]==('systemctl','reload') for event in r.events),1)
+        r.restore_nginx_public('fixture_restore')
+        self.assertEqual(self.special_http.read_bytes(),self.http_config);self.assertEqual(self.special_https.read_bytes(),self.https_config)
+        self.assertEqual(sum(event[:2]==('systemctl','reload') for event in r.events),2)
+    def release_for_profile(self,profile):
+        r=SandboxRelease(profile,self.archive,self.base);self.addCleanup(r.state_temp.cleanup);return r
+    def test_nginx_two_file_refuses_foreign_hostname_and_hash_drift_before_write(self):
+        r=self.release_for_profile(self.special_profile());r.system_path=lambda value:{'/etc/nginx/sites-available/fixture-http.conf':self.special_http,'/etc/nginx/sites-available/fixture-https.conf':self.special_https,'/etc/cron.d/fixture':self.cron_file}[value];r.nginx_path_in_scope=lambda target:True
+        self.special_https.write_bytes(self.https_config.replace(b'fixture.example.invalid',b'foreign.example.invalid'))
+        with self.assertRaisesRegex(m.Refuse,'nginx_config_hash_mismatch'):r.nginx_snapshot()
+        self.special_https.write_bytes(self.https_config);r.prepare_nginx()
+        self.special_https.write_bytes(self.https_config+b'# external drift\n')
+        with self.assertRaisesRegex(m.Refuse,'nginx_config_changed_during_stage'):r.nginx_multi(r.nginx_gates)
+        self.assertEqual(self.special_http.read_bytes(),self.http_config)
+    def test_nginx_two_file_requires_one_reviewed_fpm_binding(self):
+        p=self.special_profile();changed=self.https_config.replace(b'/run/php/php8.5-fpm.sock',b'/run/php/php8.3-fpm.sock');self.special_https.write_bytes(changed);p['nginx_config_hashes']['/etc/nginx/sites-available/fixture-https.conf']=h(changed)
+        r=self.release_for_profile(p);r.system_path=lambda value:{'/etc/nginx/sites-available/fixture-http.conf':self.special_http,'/etc/nginx/sites-available/fixture-https.conf':self.special_https,'/etc/cron.d/fixture':self.cron_file}[value];r.nginx_path_in_scope=lambda target:True
+        with self.assertRaisesRegex(m.Refuse,'owned_vhost_fpm_binding_mismatch'):r.prepare_nginx()
+    def test_partial_dual_file_nginx_write_restores_first_file_without_reload(self):
+        r=self.prepare_special_ports(self.release_for_profile(self.special_profile()));original=r.atomic;calls=0
+        def fail_second(path,data,metadata):
+            nonlocal calls
+            calls+=1
+            if calls==2:raise OSError('synthetic second-file failure')
+            return original(path,data,metadata)
+        r.atomic=fail_second
+        with self.assertRaisesRegex(OSError,'second-file failure'):r.nginx_multi(r.nginx_gates)
+        self.assertEqual(self.special_http.read_bytes(),self.http_config);self.assertEqual(self.special_https.read_bytes(),self.https_config)
+        self.assertFalse(any(event[:2]==('systemctl','reload') for event in r.events))
+    def test_nginx_restore_refuses_external_file_drift(self):
+        r=self.prepare_special_ports(self.release_for_profile(self.special_profile()));r.nginx_multi(r.nginx_gates)
+        self.special_https.write_bytes(b'foreign content\n')
+        with self.assertRaisesRegex(m.Refuse,'nginx_config_changed_during_stage'):r.restore_nginx_public('fixture_restore')
+        self.assertIn(b'return 503',self.special_http.read_bytes());self.assertEqual(self.special_https.read_bytes(),b'foreign content\n')
+    def test_dedicated_cron_exact_user_cas_pause_and_restore(self):
+        r=self.prepare_special_ports(self.release_for_profile(self.special_profile()));paused=r.cron_paused_content
+        r.cron(paused);self.assertEqual(self.cron_file.read_bytes(),paused);self.assertEqual(r.cron_file_current_sha,h(paused))
+        r.cron(r.cron_before);self.assertEqual(self.cron_file.read_bytes(),self.cron_original)
+        self.assertFalse(any(event and event[0]=='crontab' for event in r.events))
+    def test_dedicated_cron_refuses_wrong_user_column(self):
+        p=self.special_profile();self.cron_original=self.cron_original.replace(b'www-data',b'root')
+        p['cron_file_sha256']=h(self.cron_original);p['cron_file_scheduler_user']='www-data';self.cron_file.write_bytes(self.cron_original)
+        r=self.release_for_profile(p);r.system_path=lambda value:self.cron_file
+        with self.assertRaisesRegex(m.Refuse,'exact_single_dedicated_scheduler_row_required'):r.prepare_cron_file()
+    def test_dedicated_cron_profile_sha_must_match_live_file(self):
+        p=self.special_profile();p['cron_file_sha256']='0'*64;r=self.release_for_profile(p);r.system_path=lambda value:self.cron_file
+        with self.assertRaisesRegex(m.Refuse,'dedicated_cron_file_hash_mismatch'):r.prepare_cron_file()
+    def test_dedicated_cron_compare_and_swap_refuses_drift_before_pause_or_restore(self):
+        r=self.prepare_special_ports(self.release_for_profile(self.special_profile()));self.cron_file.write_bytes(self.cron_original+b'# external\n')
+        with self.assertRaisesRegex(m.Refuse,'dedicated_cron_file_compare_and_swap_refused'):r.cron(r.cron_paused_content)
+        self.assertNotIn(b'REVIEWED_REPEAT_DEPLOY_PAUSE',self.cron_file.read_bytes())
+        self.cron_file.write_bytes(self.cron_original);r.cron(r.cron_paused_content);self.cron_file.write_bytes(b'# outside writer\n')
+        with self.assertRaisesRegex(m.Refuse,'dedicated_cron_file_compare_and_swap_refused'):r.cron(r.cron_before)
+        self.assertEqual(self.cron_file.read_bytes(),b'# outside writer\n')
     def test_typed_config_is_strict_except_explicit_same_inode_path(self):
         r=self.release();self.assertFalse(r.config_equal({'n':1},{'n':'1'}));self.assertFalse(r.config_equal([1,2],[2,1]));self.assertFalse(r.config_equal({'x':False},{'x':0}))
 
