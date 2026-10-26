@@ -157,6 +157,10 @@ class ContractTests(unittest.TestCase):
         actual=staged.stat();self.assertEqual((actual.st_uid,actual.st_gid,stat.S_IMODE(actual.st_mode),actual.st_mtime_ns),expected_metadata)
         self.assertNotIn(upload,r.p['candidate_manifest']['files'])
         self.assertEqual(r.preserved_copy_fingerprints["public/filemanager/uploads"],r.tree_fingerprint(self.live/'public/filemanager/uploads'))
+    def test_crlf_manifest_normalization_uses_real_crlf_bytes(self):
+        rel='app/CrLfFixture.php';self.live.joinpath(rel).write_bytes(b'line one\r\nline two\r\n')
+        r=self.release();manifest={'files':{rel:h(b'line one\nline two\n')},'normalization_by_path':{rel:'crlf_to_lf'}}
+        r.manifest(self.live,manifest)
     def test_customer_upload_change_after_preflight_refuses_before_staging(self):
         self.user_upload.parent.mkdir(parents=True);self.user_upload.write_bytes(b'customer upload before preflight')
         r=self.release();r.preflight();self.user_upload.write_bytes(b'customer upload received during preflight')
@@ -229,7 +233,7 @@ class ContractTests(unittest.TestCase):
         self.profile['live_manifest']=copy.deepcopy(self.profile['candidate_manifest']);self.new['app/Marker.php']=b'<?php // next release\n'
         with tarfile.open(self.archive,'w:gz')as archive:
             for name,data in self.new.items():
-                data=data.replace(b'\n',b'\n');item=tarfile.TarInfo(name);item.size=len(data);item.mtime=0;archive.addfile(item,io.BytesIO(data))
+                data=data.replace(b'\r\n',b'\n');item=tarfile.TarInfo(name);item.size=len(data);item.mtime=0;archive.addfile(item,io.BytesIO(data))
         self.profile['source_archive_sha256']=m.digest(self.archive);self.profile['candidate_manifest']['candidate_commit']='c'*40;self.profile['candidate_manifest']['files']['app/Marker.php']=h(self.new['app/Marker.php'])
         second=self.release();self.apply(second);self.assertNotEqual(middle,int((self.live/'app/Marker.php').stat().st_mtime));self.assertEqual((self.live/'app/Marker.php').read_bytes(),self.new['app/Marker.php'])
     def test_fpm_opcache_off_unbounded_or_ambiguous_is_refused(self):
@@ -297,6 +301,9 @@ class ContractTests(unittest.TestCase):
         (self.live/'app/Marker.php').write_text('unexpected');r=self.release()
         with self.assertRaises(m.Refuse):r.preflight()
         self.assertEqual(r.events,[])
+    def test_absolute_paths_reject_carriage_returns(self):
+        for value in ['/srv/app\rfile','/srv/app\nfile','/srv/app\0file']:
+            with self.subTest(value=repr(value)),self.assertRaises(m.Refuse):m.path_value(value)
     def test_provisioning_flags_and_wildcards_are_rejected(self):
         for field,value in [('run_migrations',True),('update_env',True),('manage_supervisor',True),('server_names',['*.example.invalid'])]:
             p=copy.deepcopy(self.profile);p[field]=value

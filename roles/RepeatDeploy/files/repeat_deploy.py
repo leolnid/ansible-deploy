@@ -26,7 +26,7 @@ def digest(path):
     return sha(pathlib.Path(path).read_bytes())
 
 def path_value(value):
-    if not isinstance(value, str) or not value.startswith('/') or any(c in value for c in '\n\n\0'):
+    if not isinstance(value, str) or not value.startswith('/') or any(c in value for c in '\n\r\0'):
         raise Refuse('invalid_absolute_path')
     p = pathlib.Path(value)
     if '..' in p.parts or p == pathlib.Path('/'):
@@ -329,7 +329,7 @@ class ExistingRelease:
                 raise Refuse('missing_manifest_file')
             data = path.read_bytes()
             if manifest.get('normalization_by_path', {}).get(rel) == 'crlf_to_lf':
-                data = data.replace(b'\n', b'\n')
+                data = data.replace(b'\r\n', b'\n')
             if sha(data) != expected:
                 raise Refuse('source_manifest_drift')
 
@@ -528,7 +528,7 @@ class ExistingRelease:
                'REQUEST_METHOD':'GET','QUERY_STRING':'full&json','REQUEST_URI':path+'?full&json',
                'SERVER_PROTOCOL':'HTTP/1.1','GATEWAY_INTERFACE':'CGI/1.1','CONTENT_LENGTH':'0'}
         raw = self.run(['cgi-fcgi','-bind','-connect',str(socket)],env=env)
-        body = re.split(rb'\n?\n\n?\n',raw,maxsplit=1)
+        body = re.split(rb'\r?\n\r?\n',raw,maxsplit=1)
         if len(body)!=2:
             raise Refuse('invalid_existing_fpm_status_response')
         status = json.loads(body[1])
