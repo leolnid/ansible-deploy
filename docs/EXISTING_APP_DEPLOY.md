@@ -136,9 +136,11 @@ application adopts it only after review by pinning that include URL and
 `REPEAT_DEPLOY_PACKAGE_REF` to the same 40-character package commit. Its
 `.deploy/runtime-profile.json` stores only the reviewed server enrollment and
 old-live baseline; the build job creates a new candidate manifest and archive
-from `CI_COMMIT_SHA` and that application's exact Common Gitlink. The
-candidate is never copied into the enrollment file. The builder excludes the
-entire `.deploy/` tree from the production archive.
+from `CI_COMMIT_SHA`, materializing the application's Common Gitlink only when
+the Git tree contains that exact gitlink. The candidate is never copied into
+the enrollment file. The builder excludes the entire `.deploy/` tree and the
+legacy `packages/leolnid/common-deploy/` provisioning tree from the production
+archive.
 
 Artifact creation runs as a non-deploying job. On the default branch, a manual
 read-only preflight must complete before the separate manual apply becomes

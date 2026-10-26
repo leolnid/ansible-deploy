@@ -5,7 +5,7 @@ FIXTURE_ROOT=pathlib.Path(os.environ.get('REPEAT_DEPLOY_TEST_ROOT',tempfile.gett
 class BuilderTests(unittest.TestCase):
  def setUp(self):
   self.tmp=tempfile.TemporaryDirectory(prefix='repeat-builder-',dir=FIXTURE_ROOT);self.base=pathlib.Path(self.tmp.name).resolve();assert self.base.parent==FIXTURE_ROOT and self.base.name.startswith('repeat-builder-');self.addCleanup(self.safe_cleanup);self.repo=self.base/'app';self.repo.mkdir();self.git(self.repo,'init','-q')
-  for name,content in {'artisan':b'<?php','bootstrap/app.php':b'<?php','composer.json':b'{}','composer.lock':b'{}','.deploy/runtime-profile.json':b'{"fixture":true}','.deploy/known_hosts':b'fixture public host key'}.items():p=self.repo/name;p.parent.mkdir(parents=True,exist_ok=True);p.write_bytes(content)
+  for name,content in {'artisan':b'<?php','bootstrap/app.php':b'<?php','composer.json':b'{}','composer.lock':b'{}','.deploy/runtime-profile.json':b'{"fixture":true}','.deploy/known_hosts':b'fixture public host key','packages/leolnid/common-deploy/deploy.yml':b'fixture provisioning metadata'}.items():p=self.repo/name;p.parent.mkdir(parents=True,exist_ok=True);p.write_bytes(content)
  def safe_cleanup(self):
   target=pathlib.Path(self.tmp.name).resolve();assert target==self.base and target.parent==FIXTURE_ROOT and target.name.startswith('repeat-builder-');self.tmp.cleanup()
  def git(self,repo,*args):return subprocess.check_output(['git','-C',str(repo),*args],stderr=subprocess.PIPE).decode().strip()
@@ -39,5 +39,7 @@ class BuilderTests(unittest.TestCase):
  def test_ci_enrollment_files_never_enter_the_production_release_archive(self):
   sha=self.commit(self.repo);out=self.base/'without-ci-enrollment';receipt=m.build(self.repo,sha,out);manifest=json.loads((out/'manifest.json').read_text())
   self.assertNotIn('.deploy/runtime-profile.json',manifest['files']);self.assertNotIn('.deploy/known_hosts',manifest['files'])
-  with tarfile.open(out/'source.tar.gz')as archive:self.assertNotIn('.deploy/runtime-profile.json',archive.getnames());self.assertNotIn('.deploy/known_hosts',archive.getnames())
+  self.assertNotIn('packages/leolnid/common-deploy/deploy.yml',manifest['files'])
+  with tarfile.open(out/'source.tar.gz')as archive:
+   names=archive.getnames();self.assertNotIn('.deploy/runtime-profile.json',names);self.assertNotIn('.deploy/known_hosts',names);self.assertNotIn('packages/leolnid/common-deploy/deploy.yml',names)
 if __name__=='__main__':unittest.main()
