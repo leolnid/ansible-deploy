@@ -170,6 +170,20 @@ class ContractTests(unittest.TestCase):
             r.prepare()
         self.assertEqual(self.user_upload.read_bytes(),b'first customer upload')
         self.assertIsNone(getattr(r,'stage',None));self.assertEqual(r.events,[])
+    def test_upload_created_during_quiesce_refuses_before_atomic_root_switch(self):
+        r=self.release();original_stopped=r.stopped;injected=False
+        def stop_then_create_upload():
+            nonlocal injected
+            original_stopped()
+            if not injected:
+                injected=True;self.user_upload.parent.mkdir(parents=True);self.user_upload.write_bytes(b'upload completed during drain')
+        r.stopped=stop_then_create_upload
+        with self.assertRaisesRegex(m.Refuse,'customer_uploads_changed_at_cutover_boundary'):
+            self.apply(r)
+        self.assertTrue(injected);self.assertFalse(r.swapped);self.assertFalse(r.old_moved)
+        self.assertEqual((self.live/'app/Marker.php').read_bytes(),self.old['app/Marker.php'])
+        self.assertEqual(self.user_upload.read_bytes(),b'upload completed during drain')
+        self.assertTrue(all(row['state']=='RUNNING' for row in r.statuses().values()))
     def test_recorded_state_advances_and_rejects_redirected_directory(self):
         r=self.release();self.apply(r)
         state=json.loads(r.state_path().read_text())

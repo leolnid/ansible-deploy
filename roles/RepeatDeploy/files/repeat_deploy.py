@@ -1153,6 +1153,11 @@ class ExistingRelease:
         self.drain_fpm()
         self.quiesce()
         self.stopped()
+        if self.current_user_managed_uploads_fingerprint() != self.user_managed_uploads_fingerprint:
+            raise Refuse('customer_uploads_changed_at_cutover_boundary')
+        if ('public/filemanager/uploads' in self.preserved_copy_fingerprints and
+                self.user_managed_tree_fingerprint(self.stage/'public/filemanager/uploads') != self.user_managed_uploads_fingerprint):
+            raise Refuse('staged_customer_uploads_changed_at_cutover_boundary')
         self.phase = 'atomic_release_cutover'
         self.root.rename(self.old_root)
         self.old_moved = True
